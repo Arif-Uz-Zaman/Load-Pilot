@@ -1,0 +1,18 @@
+{
+  "name": "loadpilot-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LoadPilot agent: background worker that runs JMeter jobs dispatched by the controller",
+  "main": "src/agent.js",
+  "bin": "src/agent.js",
+  "scripts": {
+    "start": "node src/agent.js",
+    "build": "npx @yao-pkg/pkg . --output dist/loadpilot-agent.exe && node hide-console.js dist/loadpilot-agent.exe"
+  },
+  "pkg": {
+    "targets": ["node22-win-x64"]
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

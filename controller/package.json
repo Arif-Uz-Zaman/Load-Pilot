@@ -1,0 +1,22 @@
+{
+  "name": "loadpilot-controller",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LoadPilot controller: upload a JMX, configure, and run distributed JMeter load tests on agent PCs",
+  "main": "src/server.js",
+  "bin": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "build": "npx @yao-pkg/pkg . --output dist/loadpilot-controller.exe"
+  },
+  "pkg": {
+    "targets": ["node22-win-x64"],
+    "assets": ["public/**/*"],
+    "scripts": ["src/**/*.js"]
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.8",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}

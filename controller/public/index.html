@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoadPilot</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Cpath d='M17.5 5 9 18h6l-1.5 9L22 14h-6l1.5-9z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="logo">
+    <div class="logo-mark">⚡</div>
+    <h1>Load<span>Pilot</span></h1>
+  </div>
+  <nav>
+    <button data-view="new" class="active">New Run</button>
+    <button data-view="dashboard">Dashboard</button>
+    <button data-view="live">Live</button>
+    <button data-view="history">History</button>
+    <button data-view="schedule">Schedule</button>
+    <button data-view="report">Report</button>
+    <button data-view="agents">Agents</button>
+  </nav>
+  <button id="themeBtn" class="icon-btn" title="Toggle dark / light mode">🌙</button>
+  <button id="settingsBtn" class="icon-btn" style="margin-left:8px;" title="Settings — file paths">⚙️</button>
+  <span id="conn" class="bad">connecting…</span>
+</header>
+
+<!-- settings modal -->
+<div id="settingsOverlay" class="overlay" style="display:none;">
+  <div class="modal card">
+    <h2>Settings — storage locations <button class="ghost mini" id="settingsClose" style="margin-left:auto;">✕ Close</button></h2>
+    <p class="hint" style="margin-top:0;">Base locations are editable. Changes are saved to <code>controller/config.json</code>
+      and take effect <b>after restarting the controller</b> (moving folders while a test runs isn't safe —
+      existing files are NOT moved automatically; copy them to the new location before restarting).</p>
+    <div id="settingsEditable"></div>
+
+    <h2 style="margin-top:22px;">Google Sheets sync</h2>
+    <p class="hint" style="margin-top:0;">Auto-append each finished run's results as a row in your Google Sheet — no more manual entry.
+      <a href="#" id="sheetsHelp">Show one-time setup steps ▸</a></p>
+    <div id="sheetsHelpBox" class="sheets-help" style="display:none;">
+      <ol>
+        <li>Open your Google Sheet → <b>Extensions → Apps Script</b>.</li>
+        <li>Delete anything there and paste this, then <b>Save</b>. It auto-detects your layout: a tab named
+          <b>Main Report</b> + one tab per person → fills A,B,D,E,F on Main and G,H,I,J on each person's tab (leaving your
+          formula columns alone); otherwise it just appends one flat row to the first sheet.
+          <pre class="sheets-code" id="sheetsSnippet">function doPost(e) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var d = JSON.parse(e.postData.contents);
+  var main = ss.getSheetByName('Main Report');
+  if (main) {                                    // report layout: Main Report + one tab per person
+    var R = nextRow_(main, 2);                   // next free row (anchored on col B = Action)
+    main.getRange(R, 1).setValue(d.date);        // A  Date
+    main.getRange(R, 2).setValue(d.action);      // B  Action / Section
+    main.getRange(R, 4).setValue(d.totalThread); // D  Total threads (all agents)
+    main.getRange(R, 5).setValue(d.ramp);        // E  Ramp
+    main.getRange(R, 6).setValue(d.loop);        // F  Loop
+    (d.persons || []).forEach(function (p) {
+      var sh = findPersonSheet_(ss, p.person);
+      if (!sh) return;
+      sh.getRange(R, 7).setValue(p.errorRatePct);  // G  Error Rate %
+      sh.getRange(R, 8).setValue(p.throughput);    // H  Throughput
+      sh.getRange(R, 9).setValue(p.time);          // I  Time
+      sh.getRange(R, 10).setValue(p.thread);       // J  individual Thread
+    });
+  } else {                                       // simple layout: one flat row on the first sheet
+    var s0 = ss.getSheets()[0];
+    if (s0.getLastRow() === 0) s0.appendRow(['Date','Plan','Target','Agents','Duration(s)','Samples','Errors','Error %','Avg','Median','p90','p95','p99','Min','Max','Throughput']);
+    s0.appendRow([d.date, d.plan, d.target, d.agents, d.durationSec, d.samples, d.errors, d.errorPct, d.avg, d.median, d.p90, d.p95, d.p99, d.min, d.max, d.throughput]);
+  }
+  return ContentService.createTextOutput('ok');
+}
+
+function doGet() { return ContentService.createTextOutput('LoadPilot Google Sheets sync is connected.'); }
+
+function nextRow_(sh, col) {                      // last used row in `col`, + 1 (skips formula cells elsewhere)
+  var v = sh.getRange(1, col, sh.getMaxRows(), 1).getValues(), r = 2;
+  for (var i = 0; i &lt; v.length; i++) if (v[i][0] !== '' &amp;&amp; v[i][0] !== null) r = i + 2;
+  return r;
+}
+
+function findPersonSheet_(ss, person) {           // match a person to its tab ("9-mizan" ~ "mizan")
+  var norm = function (s) { return String(s).replace(/^\s*\d+\s*[-_. ]\s*/, '').trim().toLowerCase(); };
+  var target = norm(person), hit = null;
+  if (!target) return null;
+  ss.getSheets().forEach(function (s) {
+    if (s.getName() === 'Main Report') return;
+    var n = norm(s.getName());
+    if (n === target) hit = s;
+    else if (!hit &amp;&amp; n &amp;&amp; (n.indexOf(target) &gt;= 0 || target.indexOf(n) &gt;= 0)) hit = s;
+  });
+  return hit;
+}</pre>
+          <button class="ghost mini" id="sheetsCopy">Copy code</button>
+        </li>
+        <li><b>Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy</b> (keeps the same URL).
+          First time only: <b>Deploy → New deployment → Web app</b>, Execute as <b>Me</b>, Who has access <b>Anyone</b>.</li>
+        <li>Copy the <b>Web app URL</b> (ends in <code>/exec</code>) and paste it below.</li>
+      </ol>
+    </div>
+    <label class="df-header" style="font-size:14px;"><input type="checkbox" id="sheetsEnabled"> Auto-sync every finished run to my sheet</label>
+    <label class="field" style="margin-top:8px; display:block;">Web App URL
+      <input type="text" id="sheetsUrl" placeholder="https://script.google.com/macros/s/…/exec" style="width:100%; max-width:640px;">
+    </label>
+    <div style="display:flex; gap:10px; align-items:center; margin-top:10px;">
+      <button class="ghost" id="sheetsTest">Send test row</button>
+      <button class="primary" id="sheetsSave">Save sync settings</button>
+      <span id="sheetsMsg" class="hint" style="margin:0;"></span>
+    </div>
+
+    <h2 style="margin-top:22px;">Portable controller — assign agents</h2>
+    <p class="hint" style="margin-top:0;">List each worker PC. <b>Tick</b> the agents <b>this</b> controller should own, then
+      <b>Point ticked agents here</b>. Two controllers can run at once — each ticks a <b>different</b> set, so each drives its
+      own agents with no overlap. Untick an agent to leave it for the other controller.
+      <a href="#" id="agentDirHelp">How it works ▸</a></p>
+    <div id="agentDirHelpBox" class="sheets-help" style="display:none;">
+      <ol>
+        <li>Each agent listens on port <b>4101</b> for a "switch controller" command (installer opens this port in Windows Firewall).</li>
+        <li><b>This controller's address</b> is auto-detected below — ticked agents get pointed here. Override only if this PC has several network cards.</li>
+        <li><b>Two controllers:</b> on PC-A tick agents 1–3, on PC-B tick agents 4–5. Each clicks "Point ticked agents here" and runs its own tests in parallel. Keep the ticked sets <b>separate</b> — if both tick the same agent, whoever clicks last takes it.</li>
+        <li>An agent already running a test is skipped (shown as "busy") — you can't yank it mid-run.</li>
+      </ol>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; margin:6px 0;">
+      <button class="ghost" id="agentDirDiscover">🔍 Discover agents on my network</button>
+      <span class="hint" style="margin:0;">scans this LAN for agents and fills the list below</span>
+    </div>
+    <table class="agent-dir" id="agentDirTable">
+      <thead><tr><th>Use</th><th>Agent PC IP</th><th>Label (optional)</th><th>Now on</th><th></th></tr></thead>
+      <tbody id="agentDirRows"></tbody>
+    </table>
+    <button class="ghost mini" id="agentDirAdd" style="margin-top:6px;">+ Add agent PC manually</button>
+    <label class="field" style="display:block; margin-top:10px;">This controller's address <span class="hint" style="margin:0;">(ticked agents will point here)</span>
+      <input type="text" id="agentControllerUrl" placeholder="" style="width:100%; max-width:640px;">
+    </label>
+    <div style="display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap:wrap;">
+      <button class="ghost" id="agentDirSave">Save list</button>
+      <button class="ghost" id="agentDirCheck">Check who's reachable</button>
+      <button class="primary" id="agentDirRedirect">Point ticked agents here</button>
+      <span id="agentDirMsg" class="hint" style="margin:0;"></span>
+    </div>
+    <div id="agentDirResult" style="margin-top:10px;"></div>
+
+    <h2 style="margin-top:22px;">Where things are (read-only)</h2>
+    <table id="settingsDerived" style="font-size:12.5px;"></table>
+    <div style="margin-top:14px; display:flex; gap:10px; align-items:center;">
+      <button class="primary" id="settingsSave">Save</button>
+      <span id="settingsMsg" class="hint" style="margin:0;"></span>
+    </div>
+  </div>
+</div>
+
+<!-- schedule creation modal -->
+<div id="scheduleOverlay" class="overlay" style="display:none;">
+  <div class="modal card">
+    <h2>Schedule this run <button class="ghost mini" id="scheduleClose" style="margin-left:auto;">✕ Close</button></h2>
+    <p class="hint" style="margin-top:0;">Your current New Run setup — plan, agents, thread groups, variables, data files and report — is saved and launched automatically at the times below. It runs only when no other test is active and at least one of its agents is online.</p>
+    <label class="field">Name <input type="text" id="schName" placeholder="e.g. Nightly baseline" autocomplete="off"></label>
+    <div class="field" style="margin-bottom:8px;">Repeat
+      <div class="seg" id="schType">
+        <button type="button" data-t="daily" class="active">Daily</button>
+        <button type="button" data-t="weekly">Weekly</button>
+        <button type="button" data-t="once">Once</button>
+      </div>
+    </div>
+    <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end;">
+      <label class="field" id="schDateWrap" style="display:none;">Date <input type="date" id="schDate"></label>
+      <label class="field">Time <input type="time" id="schTime" value="02:00"></label>
+    </div>
+    <div class="field" id="schDaysWrap" style="display:none; margin-top:4px;">On these days
+      <div class="weekday-pick" id="schDays">
+        <label><input type="checkbox" value="6">Sat</label>
+        <label><input type="checkbox" value="0">Sun</label>
+        <label><input type="checkbox" value="1">Mon</label>
+        <label><input type="checkbox" value="2">Tue</label>
+        <label><input type="checkbox" value="3">Wed</label>
+        <label><input type="checkbox" value="4">Thu</label>
+        <label><input type="checkbox" value="5">Fri</label>
+      </div>
+    </div>
+    <div style="display:flex; gap:12px; align-items:center; margin-top:18px;">
+      <button class="primary" id="schSave">Create schedule</button>
+      <span id="schMsg" class="hint" style="margin:0;"></span>
+    </div>
+  </div>
+</div>
+
+<main>
+  <!-- ============ NEW RUN ============ -->
+  <section id="view-new" class="view active">
+    <div class="newrun-grid">
+      <!-- main config column -->
+      <div class="newrun-main">
+        <div class="card">
+          <h2><span class="step">1</span> Test plan (JMX)</h2>
+          <div id="dropzone" class="dropzone"><span class="dz-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2.5H6.5a1.5 1.5 0 0 0-1.5 1.5v16a1.5 1.5 0 0 0 1.5 1.5h11a1.5 1.5 0 0 0 1.5-1.5V8.5zM13 2.5V8.5h6"/></svg></span>Drop a .jmx file here or click to browse</div>
+          <input type="file" id="jmxFile" accept=".jmx" hidden>
+          <div id="planInfo" style="margin-top:12px; display:none;">
+            <b id="planName"></b> <span id="planFileName" style="color:var(--muted)"></span>
+            <button class="ghost mini" id="openInJmeter" style="margin-left:8px; display:none;" title="Open a copy in the bundled JMeter GUI on the controller PC">✎ Open in JMeter</button>
+            <div id="jmeterEditPanel" class="jmeter-edit" style="display:none;">
+              <span id="jmeterEditMsg" class="hint" style="margin:0;"></span>
+              <span style="display:flex; gap:8px; margin-top:6px;">
+                <button class="primary mini" id="importEdited">Import edited plan</button>
+                <button class="ghost mini" id="cancelEdited">Cancel</button>
+              </span>
+            </div>
+            <p id="planWarn" class="hint" style="display:none; color:var(--warning); font-weight:600;"></p>
+            <div id="csvRefs"></div>
+            <div id="dataFilesUi" style="display:none;"></div>
+            <button class="ghost" id="addDataFile" style="display:none;">+ Add data file</button>
+            <input type="file" id="dataFile" hidden multiple>
+          </div>
+        </div>
+
+        <div class="card" id="configCard" style="display:none;">
+          <h2><span class="step">2</span> Thread groups &amp; samplers</h2>
+
+          <div id="distModeBar" class="dist-bar">
+            <span class="dist-label">Load distribution:</span>
+            <label><input type="radio" name="distMode" value="split" checked> Split evenly across agents</label>
+            <label><input type="radio" name="distMode" value="per-agent"> Per-agent profiles <span class="hint" style="margin:0">(each agent its own workload &amp; threads)</span></label>
+            <span id="agentProfilePicker" style="display:none; margin-left:auto;">
+              <label class="field" style="margin:0;">Fine-tune samplers for
+                <select id="profileAgentSel"></select>
+              </label>
+              <button class="ghost mini" id="copyProfileAll" title="Copy this agent's setup to all selected agents">Copy to all</button>
+            </span>
+          </div>
+          <p id="perAgentHint" class="hint" style="display:none;">Assign work in the tree below — <b>columns are agents</b>. Set each thread group's per-agent count — for <b>bzm rate groups it's the target rate/sec</b> (0 = that agent skips it) — and tick the scenarios/samplers each agent should run. Expand a scenario (▸) to reach its samplers.</p>
+          <div id="perAgentSummary" class="per-agent-summary" style="display:none;"></div>
+
+          <div id="tgList"></div>
+        </div>
+
+        <div class="card" id="varsCard" style="display:none;">
+          <h2>Variables <span class="hint" style="margin:0 0 0 6px; font-weight:400;">edit User Defined Variables — applied to every agent's plan</span></h2>
+          <div id="varsList"></div>
+        </div>
+
+        <div class="card" id="reportCard" style="display:none;">
+          <h2><span class="step">4</span> Report (optional)</h2>
+          <label class="df-header" style="font-size:14px;"><input type="checkbox" id="reportEnable"> Add this run to a report</label>
+          <label class="df-header" style="font-size:14px; margin-top:8px;"><input type="checkbox" id="syncSheet"> Send this run's result to Google Sheet <span id="syncSheetNote" class="hint" style="margin:0"></span></label>
+          <div id="reportOpts" style="display:none; margin-top:12px;">
+            <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end;">
+              <label class="field">Report
+                <select id="reportSel"></select>
+              </label>
+              <label class="field">Action (scenario name)
+                <input type="text" id="reportAction" placeholder="e.g. Dashboard">
+              </label>
+            </div>
+            <p class="hint">Assign each agent to a person/sheet — that agent's results fill that person's row.</p>
+            <div id="reportAssign" class="report-assign"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- sticky action rail -->
+      <aside class="newrun-rail">
+        <div class="card" id="agentCard" style="display:none;">
+          <h2><span class="step">3</span> Load generator PCs</h2>
+          <div id="agentPick" class="agent-pick"></div>
+          <p id="splitPreview" class="hint"></p>
+        </div>
+
+        <div class="card" id="settingsCard" style="display:none;">
+          <h2>Run settings</h2>
+          <label class="field">JVM heap per agent
+            <select id="heap">
+              <option>2g</option><option selected>4g</option><option>8g</option><option>12g</option>
+            </select>
+          </label>
+          <label class="field">Live update every
+            <select id="liveInterval">
+              <option value="1">1 second</option>
+              <option value="2" selected>2 seconds</option>
+              <option value="5">5 seconds</option>
+              <option value="10">10 seconds</option>
+              <option value="30">30 seconds</option>
+            </select>
+          </label>
+        </div>
+
+        <div id="startRow" class="start-rail" style="display:none;">
+          <button class="primary" id="startBtn">▶ Start load test</button>
+          <button class="ghost" id="scheduleBtn" style="width:100%; margin-top:8px; display:inline-flex; align-items:center; justify-content:center; gap:7px;">
+            <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3.5h10a1 1 0 0 1 1 1V13a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1zM2 6.5h12M5.5 2v3M10.5 2v3"/></svg>
+            Schedule this run…
+          </button>
+          <span id="startErr" style="color:var(--critical);"></span>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ============ DASHBOARD ============ -->
+  <section id="view-dashboard" class="view">
+    <div class="dash-head">
+      <div>
+        <h2 class="dash-title">Load testing dashboard</h2>
+        <p class="dash-sub" id="dashSub">Overview of all test runs</p>
+      </div>
+      <button class="ghost mini" id="dashRefresh"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5V5H11"/></svg> Refresh</button>
+    </div>
+
+    <!-- overall KPI cards -->
+    <div class="kpi-row" id="dashKpis"></div>
+
+    <!-- pass/fail SLA thresholds -->
+    <div class="sla-bar">
+      <span class="sla-label">Pass / Fail SLA</span>
+      <label class="sla-field">error rate ≤ <input id="slaErr" type="number" min="0" step="0.1" placeholder="off"> %</label>
+      <label class="sla-field">p90 ≤ <input id="slaP90" type="number" min="0" step="10" placeholder="off"> ms</label>
+      <label class="sla-field">throughput ≥ <input id="slaTp" type="number" min="0" step="1" placeholder="off"> /s</label>
+      <button class="ghost mini" id="slaSave">Save</button>
+      <span id="slaMsg" class="hint" style="margin:0;"></span>
+    </div>
+
+    <!-- filters + runs list -->
+    <div class="card dash-runs-card">
+      <div class="dash-runs-head">
+        <h3>Test runs</h3>
+        <div class="dash-filters">
+          <span class="dash-search">
+            <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.3"/><path d="m10.2 10.2 3 3" stroke-linecap="round"/></svg>
+            <input id="dashSearch" placeholder="Search plan or run id…" autocomplete="off">
+          </span>
+          <select id="dashPlan" class="dash-sel"></select>
+          <select id="dashTarget" class="dash-sel"></select>
+          <select id="dashState" class="dash-sel">
+            <option value="">All states</option>
+            <option value="finished">Finished</option>
+            <option value="done">Done</option>
+            <option value="stopped">Stopped</option>
+            <option value="error">Error</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- per-run trend bars -->
+      <div class="dash-trend-wrap">
+        <div class="dash-trend-labels"><span>Throughput per run (newest →)</span><span id="dashTrendHint" class="hint" style="margin:0"></span></div>
+        <div class="dash-trend" id="dashTrend"></div>
+      </div>
+
+      <div class="dash-table-wrap">
+        <table class="dash-table">
+          <thead><tr><th>Started</th><th>Plan</th><th>State</th><th class="num">Dur.</th><th class="num">Agents</th><th class="num">Requests</th><th class="num">Avg ms</th><th class="num">Err %</th><th class="num">Req/s</th></tr></thead>
+          <tbody id="dashRunRows"></tbody>
+        </table>
+        <div class="empty" id="dashEmpty" style="display:none;">No runs match these filters</div>
+      </div>
+    </div>
+
+    <!-- compare two runs -->
+    <div class="card dash-compare-card">
+      <div class="dash-runs-head">
+        <h3>Compare runs</h3>
+        <div class="dash-filters">
+          <select id="cmpA" class="dash-sel"></select>
+          <span class="cmp-vs">vs</span>
+          <select id="cmpB" class="dash-sel"></select>
+          <button class="ghost mini" id="cmpClear">Clear</button>
+        </div>
+      </div>
+      <div id="cmpResult"><p class="hint" style="margin:0">Pick two runs to see per-request deltas (response time, error rate, throughput).</p></div>
+    </div>
+
+    <!-- selected-run detail -->
+    <div id="dashDetail"></div>
+  </section>
+
+  <!-- ============ SCHEDULE ============ -->
+  <section id="view-schedule" class="view">
+    <div class="dash-head">
+      <div>
+        <h2 class="dash-title">Scheduled runs</h2>
+        <p class="dash-sub" id="schSub">Automated recurring load tests</p>
+      </div>
+      <button class="ghost mini" id="schRefresh"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5V5H11"/></svg> Refresh</button>
+    </div>
+    <div id="schList" class="sched-list"></div>
+  </section>
+
+  <!-- ============ REPORT ============ -->
+  <section id="view-report" class="view">
+    <div class="card">
+      <h2>Load test report
+        <span style="margin-left:auto; display:inline-flex; gap:8px;">
+          <a class="ghost" id="exportXlsx" style="text-decoration:none;"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5v7.7M8 10.2 5 7.2M8 10.2l3-3M2.8 13h10.4"/></svg> Excel (.xlsx)</a>
+          <a class="ghost" id="exportCsv" style="text-decoration:none;"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5v7.7M8 10.2 5 7.2M8 10.2l3-3M2.8 13h10.4"/></svg> CSV</a>
+          <button class="ghost" id="printReport"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 6V2.5h7V6M4.5 11.5h-1a1 1 0 0 1-1-1V7.2a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v3.3a1 1 0 0 1-1 1h-1M4.5 9.8h7v3.7h-7z"/></svg> Print</button>
+        </span>
+      </h2>
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+        <select id="reportPick" style="font-weight:600;"></select>
+        <button class="ghost mini" id="reportRename">Rename</button>
+        <button class="ghost mini" id="reportNew">+ New report</button>
+        <button class="ghost mini" id="addPerson">+ Add person / sheet</button>
+        <button class="ghost mini" id="addRow">+ Add row</button>
+        <button class="ghost mini" id="addInfraCol">+ Add column</button>
+      </div>
+      <div class="report-tabs" id="reportTabs"></div>
+      <div id="reportGrid" class="report-grid-wrap"></div>
+    </div>
+  </section>
+
+  <!-- ============ LIVE ============ -->
+  <section id="view-live" class="view">
+    <div class="card" id="liveHead">
+      <h2 id="liveTitle">No active run</h2>
+      <div class="chips" id="liveAgents"></div>
+      <div style="margin-top:12px; display:flex; align-items:flex-end; gap:16px; flex-wrap:wrap;">
+        <label class="field" style="margin:0;">Thread group
+          <select id="liveTg"><option value="">All thread groups</option></select>
+        </label>
+        <button class="primary danger" id="stopBtn" style="display:none;">■ Stop run</button>
+      </div>
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><div class="k">Elapsed</div><div class="v" id="tElapsed">–</div></div>
+      <div class="tile"><div class="k">Throughput (last 10 s)</div><div class="v" id="tTps">–</div></div>
+      <div class="tile"><div class="k">Avg response (last 10 s)</div><div class="v" id="tAvg">–</div></div>
+      <div class="tile err"><div class="k">Errors (last 10 s)</div><div class="v" id="tErr">–</div></div>
+      <div class="tile"><div class="k">Total samples</div><div class="v" id="tTotal">–</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Metrics by request</h2>
+      <div id="lazCharts"><p class="empty">waiting for samples…</p></div>
+    </div>
+
+    <div class="card">
+      <h2>Requests by sampler</h2>
+      <table>
+        <thead><tr><th>Sampler</th><th class="num">Samples</th><th class="num">Errors</th><th class="num">Avg ms</th><th class="num">Max ms</th></tr></thead>
+        <tbody id="labelRows"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Run log</h2>
+      <div id="log"></div>
+    </div>
+  </section>
+
+  <!-- ============ HISTORY ============ -->
+  <section id="view-history" class="view">
+    <div class="card" id="historyList">
+      <h2>Past runs <button class="ghost mini" id="clearRuns" style="margin-left:auto; text-transform:none;">Delete all</button></h2>
+      <table>
+        <thead><tr><th>Started</th><th>Plan</th><th>State</th><th class="num">Duration</th><th class="num">Agents</th><th class="num">Samples</th><th class="num">Avg ms</th><th class="num">Err %</th><th class="num">Throughput</th><th></th></tr></thead>
+        <tbody id="runRows"></tbody>
+      </table>
+      <div class="empty" id="runEmpty" style="display:none;">No runs yet</div>
+    </div>
+    <div id="runDetail"></div>
+  </section>
+
+  <!-- ============ AGENTS ============ -->
+  <section id="view-agents" class="view">
+    <div class="card">
+      <h2>Connected agents</h2>
+      <table>
+        <thead><tr><th>Name</th><th>Address</th><th class="num">CPU cores</th><th class="num">RAM</th><th>Live load</th><th>JMeter</th><th>State</th><th></th></tr></thead>
+        <tbody id="agentRows"></tbody>
+      </table>
+      <div class="empty" id="agentEmpty" style="display:none;">
+        No agents connected. On each worker PC run:<br><br>
+        <code>loadpilot-agent.exe http://THIS-PC-IP:4000</code>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
