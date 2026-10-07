@@ -5,6 +5,13 @@
  * so worker PCs need no inbound firewall rules.
  */
 
+const AGENT_STATES = new Set(['idle', 'running', 'preparing']);
+/** A finite number within [min, max], else null. */
+function num(v, min, max) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : null;
+}
+
 class AgentHub {
   constructor() {
     this.agents = new Map(); // name -> {ws, info, state, runId, lastSeen}
@@ -20,9 +27,10 @@ class AgentHub {
     ws.on('message', (data) => {
       let msg;
       try { msg = JSON.parse(data); } catch { return; }
+      if (!msg || typeof msg !== 'object') return; // e.g. the JSON text "null"
 
       if (msg.type === 'hello') {
-        name = String(msg.name || 'agent').replace(/[^\w.-]/g, '_');
+        name = String(msg.name || 'agent').replace(/[^\w.-]/g, '_').replace(/^\.+/, '_').slice(0, 64) || 'agent';
         // If a live connection already claims this name, suffix the newcomer.
         const existing = this.agents.get(name);
         if (existing && existing.ws.readyState === existing.ws.OPEN && existing.ws !== ws) {
@@ -33,12 +41,14 @@ class AgentHub {
         }
         this.agents.set(name, {
           ws,
+          // Anything an agent says about itself is untrusted (no auth on /ws/agent):
+          // numbers stay numbers and text stays short plain text.
           info: {
             name,
-            platform: msg.platform,
-            cpus: msg.cpus,
-            memGB: msg.memGB,
-            version: msg.agentVersion,
+            platform: String(msg.platform || '').slice(0, 80),
+            cpus: num(msg.cpus, 0, 4096),
+            memGB: num(msg.memGB, 0, 1e5),
+            version: String(msg.agentVersion || '').slice(0, 20),
             jmeterReady: !!msg.jmeterReady,
             stub: !!msg.stub,
             address: req.socket.remoteAddress,
@@ -56,8 +66,8 @@ class AgentHub {
       if (a) a.lastSeen = Date.now();
 
       if (msg.type === 'status' && a) {
-        a.state = msg.state;
-        a.runId = msg.runId || null;
+        a.state = AGENT_STATES.has(msg.state) ? msg.state : 'idle';
+        a.runId = msg.runId ? String(msg.runId).slice(0, 80) : null;
         // an agent that has bootstrapped JMeter re-reports readiness here
         if (msg.jmeterReady !== undefined) a.info.jmeterReady = !!msg.jmeterReady;
         this.onChange();
@@ -66,7 +76,7 @@ class AgentHub {
         // live CPU/RAM so the UI can flag a saturated (untrustworthy) generator.
         // Sent as a lightweight per-agent update — NOT a full agent-list rebroadcast,
         // which would re-render the whole New Run form every 2s (closing open dropdowns).
-        a.info.res = { cpu: msg.cpu, mem: msg.mem, memUsedGB: msg.memUsedGB, memTotalGB: msg.memTotalGB, at: Date.now() };
+        a.info.res = { cpu: num(msg.cpu, 0, 100), mem: num(msg.mem, 0, 100), memUsedGB: num(msg.memUsedGB, 0, 1e5), memTotalGB: num(msg.memTotalGB, 0, 1e5), at: Date.now() };
         this.onResStats(name, a.info.res);
       }
       this.onAgentMessage(name, msg);
@@ -88,7 +98,10 @@ class AgentHub {
   send(name, msg) {
     const a = this.agents.get(name);
     if (!a || a.ws.readyState !== a.ws.OPEN) return false;
-    a.ws.send(JSON.stringify(msg));
+    try { a.ws.send(JSON.stringify(msg)); } catch { return false; }
+    // Busy from the moment the job is sent: if the socket turns out to be dead
+    // before the agent ever answers, its close still ends the run (onAgentLost).
+    if (msg.type === 'job') { a.runId = msg.runId; a.state = 'running'; }
     return true;
   }
 

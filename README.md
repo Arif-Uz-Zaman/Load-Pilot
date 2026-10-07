@@ -17,6 +17,7 @@
 - [Building the executables](#building-the-executables)
 - [Building the installers](#building-the-installers)
 - [Deploying / installing](#deploying--installing)
+- [Upgrading JMeter](#upgrading-jmeter)
 - [Managing agents (portable controller)](#managing-agents-portable-controller)
 - [Data & configuration locations](#data--configuration-locations)
 - [Key features](#key-features)
@@ -246,6 +247,25 @@ $iscc = "C:\Users\<you>\AppData\Local\Programs\Inno Setup 6\ISCC.exe"   # or you
 - **Wizard:** run `LoadPilot-Agent-Setup.exe`, enter the controller URL, choose auto-start.
 
 Within seconds the PC appears under the **Agents** tab.
+
+---
+
+## Upgrading JMeter
+
+JMeter ships as **`controller/bundles/jmeter.zip`**. Agents and the controller each cache an extracted copy in their `runtime/` folder. LoadPilot **auto-upgrades** that cache: the controller exposes a bundle *fingerprint* (`GET /bundle/meta`, = zip size + mtime), each agent remembers the fingerprint it extracted (`runtime/.jmeter-bundle-version`), and when the fingerprint changes it re-downloads and replaces its JMeter automatically on the next run.
+
+**To upgrade to a new JMeter version:**
+
+1. **Build the new zip** — its root must contain `apache-jmeter-X.Y.Z/`. ⚠️ If your plans use plugins (bzm, etc.), zip **your team's JMeter folder that already has the plugin jars** in `lib/ext`, not vanilla Apache JMeter.
+2. **Replace** `controller/bundles/jmeter.zip` (and the deployed copy, e.g. `D:\LoadPilot\bundles\jmeter.zip`).
+3. **Restart the controller.** It re-extracts its own runtime automatically (fingerprint changed).
+4. **That's it for agents** — each one detects the new fingerprint and re-downloads on its next job. No per-PC cache clearing.
+5. **Rebuild `LoadPilot-Setup.exe`** so fresh installs ship the new JMeter.
+
+Notes:
+- Agents that are **offline** keep using their cached JMeter and upgrade whenever they next reach the controller — nothing breaks.
+- Existing agents from before this feature **adopt** their current JMeter as the baseline (no needless ~90 MB re-download); they only re-download once you actually change the bundle.
+- To upgrade the bundled **JRE** the same way, replace `bundles/jre.zip` (agents use system Java when present, so this is rarely needed).
 
 ---
 

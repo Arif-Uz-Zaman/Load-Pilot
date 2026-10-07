@@ -11,8 +11,15 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { createInterface } = require('readline');
 const { applyConfig, parseJmx, extractTargets } = require('./jmx');
 const { RunStats, summarizeJtl, resolveTg } = require('./stats');
+const { writeJsonAtomic } = require('./fsutil');
+
+// A disconnected agent may come back (network blip, controller hiccup) and carry on.
+const RECONNECT_GRACE_MS = 30000;
+// After Stop, an agent that says nothing for this long is given up on.
+const STOP_SILENCE_MS = 3 * 60000;
 
 const TARGETS_V = 2; // bump when extractTargets logic changes → old runs re-resolve
 
@@ -40,12 +47,68 @@ class RunManager {
     this.reports = reports; // ReportStore — runs can be recorded into a report
     this.active = null;     // in-memory state of the running test
     this._liveTimer = null;
+    this._finalizing = null;   // the run being finished (guards against a second finish)
+    this._lost = new Map();    // agent name -> timer: disconnected, waiting for it to come back
+    this._seen = new Map();    // agent name -> last message time (for the Stop watchdog)
+    this._stopWatchdog = null;
     this.onRunFinished = () => {}; // (publicRun, summary) — e.g. Google Sheets sync
+    this._recoverInterrupted();
+  }
+
+  /**
+   * A run that was still going when the controller stopped (crash, closed
+   * window, PC restart) would show "running" forever and block nothing in
+   * memory — close it out as interrupted, keeping whatever results arrived.
+   */
+  _recoverInterrupted() {
+    let dirs = [];
+    try { dirs = fs.readdirSync(this.runsDir); } catch { return; }
+    for (const d of dirs) {
+      const dir = path.join(this.runsDir, d);
+      const meta = readJson(path.join(dir, 'meta.json'));
+      if (!meta || !['preparing', 'running', 'finalizing'].includes(meta.state)) continue;
+      meta.state = 'error';
+      meta.endedAt = meta.endedAt || new Date().toISOString();
+      for (const a of meta.agents || []) {
+        if (a.state === 'preparing' || a.state === 'running') { a.state = 'error'; a.error = 'the controller stopped during the run'; }
+      }
+      try { fs.appendFileSync(path.join(dir, 'run.log'), `${new Date().toISOString()} controller was restarted during this run — closed as interrupted\n`); } catch { /* ignore */ }
+      const run = { ...meta, dir };
+      try { writeJsonAtomic(path.join(dir, 'meta.json'), this._publicRun(run)); } catch { /* read-only? */ }
+      if (fs.existsSync(path.join(dir, 'summary.json'))) continue;
+      // merge + summarise whatever results arrived, in the background
+      this._mergeJtls(run)
+        .then(() => (run.hasMerged ? summarizeJtl(path.join(dir, 'merged.jtl')) : null))
+        .then((s) => {
+          if (!s) return;
+          writeJsonAtomic(path.join(dir, 'summary.json'), s);
+          run.hasSummary = true;
+          writeJsonAtomic(path.join(dir, 'meta.json'), this._publicRun(run));
+        })
+        .catch(() => { /* no usable results */ });
+    }
   }
 
   // ---------- run creation ----------
 
-  startRun({ plan, config, library }) {
+  startRun(args) {
+    this._startingDir = null;
+    try {
+      return this._startRun(args);
+    } catch (e) {
+      // a start that failed half-way (bad profile, missing data file…) must not
+      // leave an empty run folder behind
+      const dir = this._startingDir;
+      if (dir && !(this.active && this.active.dir === dir)) {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+      throw e;
+    } finally {
+      this._startingDir = null;
+    }
+  }
+
+  _startRun({ plan, config, library }) {
     if (this.active) throw new Error(`Run ${this.active.id} is still active`);
 
     const agentNames = (config.agents || []).filter((n) => {
@@ -61,6 +124,7 @@ class RunManager {
     const id = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '-' + Math.random().toString(36).slice(2, 6);
     const dir = path.join(this.runsDir, id);
     fs.mkdirSync(dir, { recursive: true });
+    this._startingDir = dir;
 
     // Each agent ends up with: a plan file (shared or its own) + thread-count props.
     const perAgent = agentNames.map((name) => ({ name, planFile: 'plan.jmx', props: {} }));
@@ -187,6 +251,11 @@ class RunManager {
     const liveMs = Math.min(30, Math.max(1, (config.liveInterval | 0) || 2)) * 1000;
     this._liveTimer = setInterval(() => this._broadcastLive(), liveMs);
     this._broadcastRun(run);
+    // Every dispatch failed (agents vanished between the idle check and the send):
+    // finish now rather than wait forever for agents that never got the job.
+    if (!run.agents.some((a) => a.state === 'preparing' || a.state === 'running')) {
+      setImmediate(() => this._maybeFinalize(run));
+    }
     return this._publicRun(run);
   }
 
@@ -205,6 +274,10 @@ class RunManager {
     const entries = (library && library.files) || [];
     const libDir = library && library.dir;
     const out = agentNames.map(() => []);
+    // a file the plan reads that was never uploaded at all must stop the run too
+    for (const name of required) {
+      if (!entries.some((e) => e.logical === name)) throw new Error(`The plan reads "${name}" but no file is uploaded for it`);
+    }
 
     for (const entry of entries) {
       const must = required.has(entry.logical);
@@ -261,20 +334,71 @@ class RunManager {
       if (a.state === 'preparing' || a.state === 'running') this.hub.send(a.name, { type: 'stop', runId });
     }
     run.stoppedByUser = true;
+    run.stopRequestedAt = Date.now();
+    this._armStopWatchdog(run);
+  }
+
+  // After Stop, any agent that stays silent (crashed, half-dead connection) is
+  // given up on after STOP_SILENCE_MS, so the run can never hang in "running".
+  _armStopWatchdog(run) {
+    clearInterval(this._stopWatchdog);
+    this._stopWatchdog = setInterval(() => {
+      if (this.active !== run) { clearInterval(this._stopWatchdog); return; }
+      const now = Date.now();
+      let changed = false;
+      for (const a of run.agents) {
+        if (a.state !== 'preparing' && a.state !== 'running') continue;
+        const seen = Math.max(this._seen.get(a.name) || 0, run.stopRequestedAt || 0);
+        if (now - seen > STOP_SILENCE_MS) {
+          a.state = 'error';
+          a.error = 'did not respond after Stop';
+          this._appendLog(run, `[${a.name}] did not respond for ${STOP_SILENCE_MS / 60000} minutes after Stop — giving up on it`);
+          changed = true;
+        }
+      }
+      if (changed) this._maybeFinalize(run);
+    }, 15000);
   }
 
   // ---------- agent event handlers (wired from server.js) ----------
 
   onAgentMessage(name, msg) {
     const run = this.active;
+    // A dropped agent that came back idle isn't running this test any more (it
+    // was restarted, or finished while offline): don't wait out the grace period.
+    if (run && msg.type === 'status' && msg.state === 'idle' && this._lost.has(name)) {
+      const a = run.agents.find((x) => x.name === name);
+      clearTimeout(this._lost.get(name));
+      this._lost.delete(name);
+      if (a && (a.state === 'preparing' || a.state === 'running')) {
+        a.state = 'error';
+        a.error = 'agent dropped off and came back idle (restarted, or finished while offline)';
+        this._appendLog(run, `[${name}] reconnected but is no longer running this test — results it uploaded are kept`);
+        this._maybeFinalize(run);
+      }
+      return;
+    }
     if (!run || msg.runId !== run.id) return;
     const a = run.agents.find((x) => x.name === name);
     if (!a) return;
+    this._seen.set(name, Date.now());
 
     switch (msg.type) {
       case 'jobStatus': // preparing | running
-        a.state = msg.state;
+        if (msg.state !== 'preparing' && msg.state !== 'running') break;
+        if (a.state === 'preparing' || a.state === 'running') a.state = msg.state;
+        // Stop pressed before this agent got going — say it again now it's listening
+        if (run.stoppedByUser) this.hub.send(name, { type: 'stop', runId: run.id });
         this._broadcastRun(run);
+        break;
+      case 'status': // an agent that dropped off and came back, still busy with this run
+        if (msg.state === 'running' && this._lost.has(name)) {
+          clearTimeout(this._lost.get(name));
+          this._lost.delete(name);
+          this._appendLog(run, `[${name}] reconnected — still running its part of the test`);
+          if (run.stoppedByUser) this.hub.send(name, { type: 'stop', runId: run.id });
+          this._broadcastRun(run);
+        }
         break;
       case 'samples': {
         run.stats.addRows(msg.rows || []);
@@ -313,7 +437,11 @@ class RunManager {
       case 'done':
         a.exitCode = msg.exitCode;
         a.uploaded = !!msg.uploaded;
-        if (msg.exitCode !== 0 && !(msg.totalRows > 0)) {
+        if (run.stoppedByUser && !(msg.totalRows > 0)) {
+          // Stop was pressed before this agent sent its first request — not a failure.
+          a.state = 'done';
+          a.note = 'stopped before any requests were sent';
+        } else if (msg.exitCode !== 0 && !(msg.totalRows > 0)) {
           // JMeter died before producing a single sample — the plan didn't load.
           a.state = 'error';
           a.error = `JMeter exited with code ${msg.exitCode} before producing any samples — usually the plan failed to load (missing plugin jars in the JMeter bundle?). See the run log.`;
@@ -330,20 +458,32 @@ class RunManager {
     const run = this.active;
     if (!run || run.id !== runId) return;
     const a = run.agents.find((x) => x.name === name);
-    if (a && (a.state === 'preparing' || a.state === 'running')) {
+    if (!a || !(a.state === 'preparing' || a.state === 'running')) return;
+    // Give it a moment: a network blip shouldn't fail the agent (its JMeter keeps
+    // running) — only give up if it doesn't reconnect and report in.
+    this._appendLog(run, `[${name}] lost connection — waiting ${RECONNECT_GRACE_MS / 1000}s for it to come back`);
+    clearTimeout(this._lost.get(name));
+    this._lost.set(name, setTimeout(() => {
+      this._lost.delete(name);
+      if (this.active !== run || !(a.state === 'preparing' || a.state === 'running')) return;
       a.state = 'error';
       a.error = 'agent disconnected';
       this._appendLog(run, `[${name}] agent disconnected mid-run`);
       this._maybeFinalize(run);
-    }
+    }, RECONNECT_GRACE_MS));
   }
 
   // ---------- finalization ----------
 
   _maybeFinalize(run) {
     this._broadcastRun(run);
+    if (this._finalizing === run) return; // a late done/error while it's already finishing
     const pending = run.agents.some((a) => a.state === 'preparing' || a.state === 'running');
     if (pending) return;
+    this._finalizing = run;
+    for (const t of this._lost.values()) clearTimeout(t);
+    this._lost.clear();
+    clearInterval(this._stopWatchdog);
 
     // Flush the last live snapshot BEFORE stopping the ticker — short runs can
     // start and finish entirely between two 2-second broadcasts, leaving the
@@ -356,30 +496,36 @@ class RunManager {
     (async () => {
       let summary = null;
       try {
-        this._mergeJtls(run);
+        await this._mergeJtls(run);
         // Prefer the merged JTL (has byte counts -> full Summary/Aggregate
         // Report columns); fall back to live-streamed stats if no JTL arrived.
         summary = run.hasMerged
           ? await summarizeJtl(path.join(run.dir, 'merged.jtl'))
           : run.stats.finalSummary();
         summary.agents = run.agents.map(({ name, state, exitCode, error }) => ({ name, state, exitCode, error }));
-        fs.writeFileSync(path.join(run.dir, 'summary.json'), JSON.stringify(summary, null, 2));
+        writeJsonAtomic(path.join(run.dir, 'summary.json'), summary);
         run.hasSummary = true;
       } catch (e) {
-        this._appendLog(run, `finalize error: ${e.message}`);
+        try { this._appendLog(run, `finalize error: ${e.message}`); } catch { /* disk gone */ }
       }
 
-      // persist each agent's own test duration into the run meta
-      const elapsed = this._agentElapsed(run);
-      for (const a of run.agents) if (elapsed[a.name] != null) a.durationSec = elapsed[a.name];
+      try {
+        // persist each agent's own test duration into the run meta
+        const elapsed = this._agentElapsed(run);
+        for (const a of run.agents) if (elapsed[a.name] != null) a.durationSec = elapsed[a.name];
 
-      const failed = run.agents.every((a) => a.state === 'error');
-      run.state = run.stoppedByUser ? 'stopped' : failed ? 'error' : 'finished';
-      run.endedAt = new Date().toISOString();
-      this._recordToReport(run);
-      this._saveMeta(run);
-      this._broadcastRun(run);
-      this.active = null;
+        const failed = run.agents.every((a) => a.state === 'error');
+        run.state = run.stoppedByUser ? 'stopped' : failed ? 'error' : 'finished';
+        run.endedAt = new Date().toISOString();
+        this._recordToReport(run);
+        this._broadcastRun(run);
+      } catch (e) {
+        try { this._appendLog(run, `finalize error: ${e.message}`); } catch { /* ignore */ }
+      } finally {
+        // ALWAYS release the run, or no other test could ever start
+        this.active = null;
+        this._finalizing = null;
+      }
 
       // fire-and-forget external syncs (Google Sheets, …)
       if (summary && summary.overall && summary.overall.samples) {
@@ -422,19 +568,89 @@ class RunManager {
     }
   }
 
-  _mergeJtls(run) {
+  /**
+   * Merge every agent's results into merged.jtl, in time order. Streams line by
+   * line (each agent's file is already close to time order, so a k-way merge
+   * by timestamp keeps the output ordered) — a big run's results can be far
+   * larger than what fits in one string or in memory.
+   */
+  async _mergeJtls(run) {
     const files = fs.readdirSync(run.dir).filter((f) => /^results-.*\.jtl$/.test(f));
     if (!files.length) return;
+    const ROW = /^\d{13},/;
+    const sources = files.map((f) => {
+      const file = path.join(run.dir, f);
+      // Stop kills JMeter mid-write: a last line without its newline is torn
+      // ("1784604426123,16,431 ") and would become a phantom failed sample — or,
+      // cut inside the timestamp, wreck every duration and throughput. Drop it.
+      let torn = false;
+      try {
+        const size = fs.statSync(file).size;
+        if (size > 0) {
+          const fd = fs.openSync(file, 'r');
+          const b = Buffer.alloc(1);
+          fs.readSync(fd, b, 0, 1, size - 1);
+          fs.closeSync(fd);
+          torn = b[0] !== 0x0a;
+        }
+      } catch { /* unreadable: the reader below fails the same way */ }
+      const it = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity })[Symbol.asyncIterator]();
+      return { it, torn, held: null, first: true, head: null, done: false };
+    });
+
     let header = null;
-    const rows = [];
-    for (const f of files) {
-      const lines = fs.readFileSync(path.join(run.dir, f), 'utf8').split(/\r?\n/);
-      if (!lines.length) continue;
-      if (!header) header = lines[0];
-      for (let i = 1; i < lines.length; i++) if (lines[i]) rows.push(lines[i]);
+    // Next sample row of one source (one line held back, so a torn last line is never emitted).
+    const next = async (s) => {
+      for (;;) {
+        const r = await s.it.next();
+        if (r.done) {
+          const last = s.held;
+          s.held = null;
+          s.done = true;
+          return last != null && !s.torn ? last : null;
+        }
+        const line = r.value;
+        if (s.first) { s.first = false; if (!header) header = line; continue; }
+        if (!ROW.test(line)) continue;
+        const out = s.held;
+        s.held = line;
+        if (out != null) return out;
+      }
+    };
+    for (const s of sources) s.head = await next(s);
+
+    const target = path.join(run.dir, 'merged.jtl');
+    const tmp = `${target}.part`;
+    const out = fs.createWriteStream(tmp);
+    const failed = new Promise((_, reject) => out.on('error', reject));
+    failed.catch(() => {});
+    const write = async (text) => {
+      if (!out.write(text)) await Promise.race([new Promise((r) => out.once('drain', r)), failed]);
+    };
+    try {
+      await write(`${header || ''}\n`);
+      let batch = [];
+      for (;;) {
+        let pick = null;
+        let ts = Infinity;
+        for (const s of sources) {
+          if (s.head == null) continue;
+          const t = parseInt(s.head, 10); // JTL lines start with the timestamp
+          if (t < ts) { ts = t; pick = s; }
+        }
+        if (!pick) break;
+        batch.push(pick.head);
+        pick.head = await next(pick);
+        if (batch.length >= 2000) { await write(`${batch.join('\n')}\n`); batch = []; }
+      }
+      if (batch.length) await write(`${batch.join('\n')}\n`);
+      await Promise.race([new Promise((r) => out.end(r)), failed]);
+      fs.renameSync(tmp, target);
+    } catch (e) {
+      out.destroy();
+      try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+      throw e;
     }
-    rows.sort((x, y) => parseInt(x, 10) - parseInt(y, 10)); // JTL lines start with the timestamp
-    fs.writeFileSync(path.join(run.dir, 'merged.jtl'), header + '\n' + rows.join('\n') + '\n');
     run.hasMerged = true;
     this._saveMeta(run);
   }
@@ -554,7 +770,7 @@ class RunManager {
   }
 
   _saveMeta(run) {
-    fs.writeFileSync(path.join(run.dir, 'meta.json'), JSON.stringify(this._publicRun(run), null, 2));
+    writeJsonAtomic(path.join(run.dir, 'meta.json'), this._publicRun(run));
   }
 
   _appendLog(run, line) {
@@ -592,8 +808,9 @@ function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
+// Never a leading dot: ".." / "." would point at the parent / same folder.
 function safeName(s) {
-  return String(s).replace(/[^\w.-]/g, '_');
+  return String(s).replace(/[^\w.-]/g, '_').replace(/^\.+/, (m) => '_'.repeat(m.length)) || '_';
 }
 
 module.exports = { RunManager, findJmeter };

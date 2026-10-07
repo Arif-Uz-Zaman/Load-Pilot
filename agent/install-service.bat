@@ -53,6 +53,8 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
+rem no 3-day time limit, runs on battery, restarts after a crash
+powershell -NoProfile -Command "Set-ScheduledTask -TaskName LoadPilotAgent -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1))" >/dev/null 2>&1
 schtasks /Run /TN "LoadPilotAgent" >nul
 echo.
 echo Installed as a BOOT task (invisible, runs before anyone logs in).
@@ -73,6 +75,8 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
+rem no 3-day time limit, runs on battery, restarts after a crash
+powershell -NoProfile -Command "Set-ScheduledTask -TaskName LoadPilotAgent -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1))" >/dev/null 2>&1
 schtasks /Run /TN "LoadPilotAgent" >nul
 echo Installed as a LOGON task.
 

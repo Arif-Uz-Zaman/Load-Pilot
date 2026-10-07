@@ -57,6 +57,7 @@ const ICONS = {
   gauge:    'CIRCLE M8 8l2.6-1.8',
   cube:     'M8 1.7 14 5v6l-6 3.3L2 11V5zM2 5l6 3.3 6-3.3M8 8.3V15',
   fail:     'CIRCLE M6 6l4 4M10 6l-4 4',
+  check:    'M3.2 8.4 6.4 11.5 12.8 4.8',
 };
 function ic(name, cls) {
   const d = ICONS[name] || '';
@@ -94,6 +95,8 @@ async function ensureSla() {
 
 const state = {
   agents: [],
+  teams: [],           // saved agent groups
+  editingTeamId: null, // team being edited in the Team view
   plan: null,       // uploaded plan {id, name, structure}
   library: [],      // persistent data-file library (shared across all plans)
   run: null,        // active/last run meta
@@ -109,9 +112,19 @@ function applyTheme(t) { // 'dark' | 'light' | null (follow OS)
   if (t) document.documentElement.dataset.theme = t;
   else delete document.documentElement.dataset.theme;
   const dark = t ? t === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
-  $('themeBtn').textContent = dark ? '☀️' : '🌙';
+  // line icons (no emoji): show the mode you'd switch TO
+  $('themeBtn').innerHTML = dark
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></svg>';
+  $('themeBtn').title = dark ? 'Switch to light mode' : 'Switch to dark mode';
   // charts hold resolved colors — repaint them against the new palette
-  document.querySelectorAll('canvas.chart').forEach((c) => { if (c._chart) redraw(c); });
+  document.querySelectorAll('canvas').forEach(repaintCanvas);
+}
+
+function repaintCanvas(c) {
+  if (!c.clientWidth) return;
+  if (c._area) drawArea(c, c._area.cfg);
+  else if (c._chart) redraw(c);
 }
 
 $('themeBtn').onclick = () => {
@@ -132,27 +145,91 @@ const SETTING_LABELS = {
   port: 'Controller port',
 };
 
-$('settingsBtn').onclick = async () => {
+// ---------------- settings page (General · Integrations · Storage) ----------------
+
+async function loadSettingsPage() {
   $('settingsMsg').textContent = '';
   try {
     const s = await api('GET', '/api/settings');
     $('settingsEditable').innerHTML = Object.entries(s.editable).map(([k, v]) => `
       <div class="settings-field">
-        <label>${SETTING_LABELS[k] || k}</label>
-        <input data-setting="${k}" value="${esc(v)}">
+        <label for="set-${esc(k)}">${SETTING_LABELS[k] || k}</label>
+        <input id="set-${esc(k)}" data-setting="${k}" value="${esc(v)}">
       </div>`).join('');
     $('settingsDerived').innerHTML = Object.entries(s.derived).map(([k, v]) =>
       `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join('');
-    loadSheetsSettings();
-    loadAgentDir();
-    $('settingsOverlay').style.display = 'flex';
   } catch (e) {
-    alert(`Could not load settings: ${e.message}`);
+    $('settingsMsg').textContent = `Could not load storage settings: ${e.message}`;
   }
+  loadSheetsSettings();
+  slaThresholds = null;
+  await ensureSla();
+  const t = slaThresholds || {};
+  $('setSlaErr').value = t.maxErrorPct ?? '';
+  $('setSlaP90').value = t.maxP90Ms ?? '';
+  $('setSlaTp').value = t.minThroughput ?? '';
+  $('setCtrlUrl').textContent = await controllerUrl();
+  const cur = localStorage.getItem('lp-theme') || '';
+  document.querySelectorAll('#setTheme [data-theme]').forEach((b) => b.classList.toggle('active', b.dataset.theme === cur));
+}
+
+// The address agents use to reach this controller (LAN IP, not "localhost").
+let ctrlUrlCache = null;
+async function controllerUrl() {
+  if (ctrlUrlCache) return ctrlUrlCache;
+  try {
+    const d = await api('GET', '/api/agent-directory');
+    ctrlUrlCache = d.controllerUrl || d.detectedUrl || location.origin;
+  } catch { return location.origin; }
+  return ctrlUrlCache;
+}
+
+function settingsSec(sec) {
+  document.querySelectorAll('.settings-nav [data-sec]').forEach((b) => {
+    const on = b.dataset.sec === sec;
+    b.classList.toggle('on', on);
+    if (on) b.setAttribute('aria-current', 'true'); else b.removeAttribute('aria-current');
+  });
+  document.querySelectorAll('.settings-sec').forEach((s) => { s.hidden = s.dataset.sec !== sec; });
+}
+document.querySelectorAll('.settings-nav [data-sec]').forEach((b) => (b.onclick = () => settingsSec(b.dataset.sec)));
+
+$('setSlaSave').onclick = async () => {
+  const val = (id) => ($(id).value === '' ? null : Number($(id).value));
+  try {
+    const d = await api('PUT', '/api/sla', { maxErrorPct: val('setSlaErr'), maxP90Ms: val('setSlaP90'), minThroughput: val('setSlaTp') });
+    slaThresholds = d.sla;
+    $('setSlaMsg').textContent = '✓ Saved — every run is now judged by these limits.';
+    setTimeout(() => { $('setSlaMsg').textContent = ''; }, 3000);
+  } catch (e) { $('setSlaMsg').textContent = `✗ ${e.message}`; }
 };
 
-$('settingsClose').onclick = () => { $('settingsOverlay').style.display = 'none'; };
-$('settingsOverlay').onclick = (e) => { if (e.target === $('settingsOverlay')) $('settingsOverlay').style.display = 'none'; };
+// Stop the controller from the browser (it often runs hidden, with no window to close).
+$('setShutdown').onclick = async () => {
+  const msg = $('setShutdownMsg');
+  if (!confirm('Stop the LoadPilot controller?\n\nNobody can use LoadPilot until it is started again on this PC.')) return;
+  const post = (force) => fetch('/api/shutdown', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ force }),
+  }).then(async (res) => ({ status: res.status, d: await res.json().catch(() => ({})) }));
+  try {
+    let r = await post(false);
+    if (r.status === 409) {
+      if (!confirm(`${r.d.error}\n\nStop the controller anyway? The running test is cut off and marked as an error.`)) return;
+      r = await post(true);
+    }
+    if (r.status !== 200) throw new Error(r.d.error || `HTTP ${r.status}`);
+    controllerStopped = true;
+    $('stoppedNotice').hidden = false;
+    msg.textContent = 'Stopping…';
+  } catch (e) { msg.textContent = `✗ ${e.message}`; }
+};
+
+document.querySelectorAll('#setTheme [data-theme]').forEach((b) => (b.onclick = () => {
+  const t = b.dataset.theme;
+  if (t) localStorage.setItem('lp-theme', t); else localStorage.removeItem('lp-theme');
+  applyTheme(t || null);
+  document.querySelectorAll('#setTheme [data-theme]').forEach((x) => x.classList.toggle('active', x === b));
+}));
 
 $('settingsSave').onclick = async () => {
   const patch = {};
@@ -175,7 +252,7 @@ async function refreshSheetOptIn() {
   try { s = await api('GET', '/api/sheets'); } catch { /* leave defaults */ }
   if (!s.url) {
     cb.checked = false; cb.disabled = true;
-    note.innerHTML = '— set up Google Sheets in <b>Settings ⚙</b> first';
+    note.innerHTML = '— set up Google Sheets first in <a href="#settings">Settings → Integrations</a>';
   } else if (s.enabled) {
     cb.checked = true; cb.disabled = true;
     note.textContent = '— every run already auto-syncs (Settings)';
@@ -375,33 +452,81 @@ $('agentDirRedirect').onclick = async () => {
 
 // ---------------- view switching ----------------
 
-document.querySelectorAll('nav button').forEach((b) => {
+// Sidebar section + page title for each view (top bar breadcrumb).
+const VIEW_TITLES = {
+  home: ['Home', 'Overview'],
+  new: ['Run', 'New run'], live: ['Run', 'Live monitor'], schedule: ['Run', 'Schedules'],
+  runs: ['Results', 'Runs'], run: ['Results / Runs', 'Run detail'], report: ['Results', 'Reports'],
+  fleet: ['Fleet', 'Agents & teams'], settings: ['Fleet', 'Settings'],
+};
+// old bookmarks keep working
+const VIEW_ALIASES = { dashboard: 'runs', history: 'runs', agents: 'fleet', team: 'fleet' };
+
+document.querySelectorAll('.side-nav button[data-view]').forEach((b) => {
   b.onclick = () => showView(b.dataset.view);
 });
+$('ctrlAddr').textContent = location.host;
 
-function showView(name) {
-  document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+// Each page has its own address (#runs, #run/<id> …) so Back/Forward, reload
+// and bookmarks land on the same page.
+function showView(name, opts = {}) {
+  name = VIEW_ALIASES[name] || name;
+  const navKey = name === 'run' ? 'runs' : name;
+  document.querySelectorAll('.side-nav button[data-view]').forEach((b) => {
+    const on = b.dataset.view === navKey;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+  const [crumb, title] = VIEW_TITLES[name] || ['', name];
+  $('crumb').textContent = crumb;
+  $('pageTitle').textContent = title;
+  document.title = `${title} · LoadPilot`;
   document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
-  if (name === 'history') loadHistory();
+  const hash = opts.hash || name;
+  if (!opts.fromHistory && location.hash.slice(1) !== hash) history[opts.replace ? 'replaceState' : 'pushState'](null, '', `#${hash}`);
+  // charts drawn while their view was hidden (e.g. last run loaded at boot) have 0 width — repaint now
+  requestAnimationFrame(() => document.querySelectorAll(`#view-${name} canvas`).forEach(repaintCanvas));
+  if (name === 'home') loadHome();
+  if (name === 'new') loadRecentPlans();
+  if (name === 'runs') loadRuns();
   if (name === 'report') loadReportView();
-  if (name === 'dashboard') loadDashboard();
   if (name === 'schedule') loadSchedules();
+  if (name === 'fleet') loadFleet();
+  if (name === 'settings') loadSettingsPage();
 }
+
+function routeFromHash() {
+  let h = location.hash.slice(1);
+  try { h = decodeURIComponent(h); } catch { /* a stray % in a hand-typed address */ }
+  const m = /^run\/(.+)$/.exec(h);
+  if (m) return openRun(m[1], { fromHistory: true });
+  const name = VIEW_ALIASES[h] || h;
+  if (VIEW_ALIASES[h]) history.replaceState(null, '', `#${name}`); // old bookmark → current address
+  showView(name && $(`view-${name}`) ? name : 'home', { fromHistory: true });
+}
+window.addEventListener('popstate', routeFromHash);
 
 // ---------------- websocket ----------------
 
 let ws;
+let wsOpenedBefore = false;
+let controllerStopped = false;
 function connectWs() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/ui`);
-  ws.onopen = () => { $('conn').textContent = 'connected'; $('conn').className = 'ok'; };
+  ws.onopen = () => {
+    $('conn').textContent = 'connected'; $('conn').className = 'ok';
+    if (controllerStopped) { controllerStopped = false; $('stoppedNotice').hidden = true; $('setShutdownMsg').textContent = ''; }
+    if (wsOpenedBefore) resyncRuns(); // updates sent while we were cut off are gone
+    wsOpenedBefore = true;
+  };
   ws.onclose = () => {
-    $('conn').textContent = 'reconnecting…';
+    $('conn').textContent = controllerStopped ? 'controller stopped' : 'reconnecting…';
     $('conn').className = 'bad';
-    setTimeout(connectWs, 2000);
+    setTimeout(connectWs, controllerStopped ? 5000 : 2000);
   };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
-    if (msg.type === 'agents') { state.agents = msg.agents; renderAgents(); renderAgentPick(); }
+    if (msg.type === 'agents') { state.agents = msg.agents; renderAgents(); renderAgentPick(); if ($('view-home').classList.contains('active')) renderHome(); }
     if (msg.type === 'agentRes') {
       const a = (state.agents || []).find((x) => x.name === msg.name);
       if (a) { a.res = msg.res; updateResMeters(); }
@@ -415,7 +540,25 @@ function connectWs() {
     if (msg.type === 'schedulesUpdated') {
       if (document.getElementById('view-schedule').classList.contains('active')) loadSchedules();
     }
+    if (msg.type === 'controllerStopping') {
+      controllerStopped = true;
+      $('stoppedNotice').hidden = false;
+    }
   };
+}
+
+// After a dropped connection: catch up on the run we were showing, or one that
+// started meanwhile (e.g. from a schedule).
+async function resyncRuns() {
+  try {
+    const runs = await api('GET', '/api/runs');
+    const active = runs.find((r) => isActiveRun(r));
+    const mine = state.run && runs.find((r) => r.id === state.run.id);
+    if (mine) onRunUpdate(mine);
+    if (active && (!mine || active.id !== mine.id)) onRunUpdate(active);
+    if ($('view-home').classList.contains('active')) loadHome();
+    if ($('view-runs').classList.contains('active')) loadRuns();
+  } catch { /* still starting up */ }
 }
 connectWs();
 
@@ -437,7 +580,7 @@ async function uploadPlan(file) {
   try {
     const res = await fetch('/api/plans', {
       method: 'POST',
-      headers: { 'content-type': 'application/octet-stream', 'x-filename': file.name },
+      headers: { 'content-type': 'application/octet-stream', 'x-filename': encodeURIComponent(file.name) },
       body: file,
     });
     const plan = await res.json();
@@ -476,7 +619,12 @@ function applyLoadedPlan(plan) {
   $('agentCard').style.display = 'block';
   $('settingsCard').style.display = 'block';
   $('reportCard').style.display = 'block';
-  $('startRow').style.display = 'flex';
+  // Start/Schedule live in the wizard footer on step 4; wizRender decides visibility.
+  if (recentPlansCache && !recentPlansCache.some((p) => p.id === plan.id)) {
+    recentPlansCache.unshift({ id: plan.id, name: plan.name, fileName: plan.fileName, uploadedAt: plan.uploadedAt });
+  }
+  renderRecentPlans();
+  wizRender();
   loadReportsForRunPage();
   refreshSheetOptIn();
   // "Open in JMeter" available for any loaded plan; hide any stale edit panel.
@@ -516,6 +664,365 @@ if ($('cancelEdited')) $('cancelEdited').onclick = () => {
   $('jmeterEditPanel').style.display = 'none';
 };
 
+// ---------------- New Run wizard: Plan → Workload → Agents → Review ----------------
+// The steps are the SAME cards and handlers as before, shown one step at a time;
+// nothing about how a run is configured or started changed.
+const WIZ_STEPS = 4;
+state.wizStep = 1;
+let recentPlansCache = null;
+
+const isSetupTg = (tg) => tg.tag === 'SetupThreadGroup' || tg.tag === 'PostThreadGroup';
+const isRateTg = (tg) => tg.kind === 'arrivals' || tg.kind === 'concurrency';
+
+function wizGo(n) {
+  n = Math.max(1, Math.min(WIZ_STEPS, n));
+  if (n > 1 && !state.plan) n = 1;
+  state.wizStep = n;
+  wizRender();
+  if (n === 4) { renderReview(); renderPreflight(); }
+  const top = $('wizSteps');
+  if (top && top.getBoundingClientRect().top < 0) top.scrollIntoView({ block: 'start' });
+}
+
+function wizRender() {
+  const n = state.wizStep || 1;
+  document.querySelectorAll('#view-new .wiz-step').forEach((s) => { s.hidden = +s.dataset.step !== n; });
+  document.querySelectorAll('#wizSteps .wiz-step-btn').forEach((b) => {
+    const k = +b.dataset.step;
+    b.classList.toggle('current', k === n);
+    b.classList.toggle('done', k < n);
+    b.disabled = k > 1 && !state.plan;
+    if (k === n) b.setAttribute('aria-current', 'step'); else b.removeAttribute('aria-current');
+  });
+  document.querySelectorAll('#wizSteps .wiz-line').forEach((l, i) => l.classList.toggle('done', i + 1 < n));
+  $('wizBack').style.visibility = n > 1 ? 'visible' : 'hidden';
+  const last = n === WIZ_STEPS;
+  $('wizNext').style.display = last ? 'none' : '';
+  $('wizNext').disabled = n === 1 && !state.plan;
+  $('wizNext').textContent = ['', 'Continue to workload →', 'Continue to agents →', 'Continue to review →'][n] || 'Continue →';
+  $('startRow').style.display = last && state.plan ? 'flex' : 'none';
+  $('wizHint').textContent = n === 1 && !state.plan ? 'Upload a .jmx file or pick a recent plan to continue.' : '';
+  if (!last) $('startErr').textContent = '';
+  updateWizSubs();
+  renderRunSummary();
+}
+
+// Totals for the summary/review. Normal groups split a TOTAL across agents;
+// setUp/tearDown run their threads on EACH agent; bzm groups are a rate.
+function workloadSummary() {
+  const out = { users: 0, groups: [], samplersOn: 0, samplersTotal: 0, perAgentUsers: {} };
+  if (!state.plan) return out;
+  const s = state.plan.structure;
+  let cfg;
+  try { cfg = readFormConfig(); } catch { return out; }
+  const usersOf = (c) => (c.threadGroups || []).reduce((sum, t) => {
+    const tg = s.threadGroups.find((x) => x.id === t.id);
+    if (!tg || !t.enabled || isSetupTg(tg) || isRateTg(tg)) return sum;
+    return sum + (+(t.threads != null ? t.threads : tg.threads) || 0);
+  }, 0);
+  // In per-agent mode every agent has its own profile: a group is "on" if any
+  // agent runs it, and its total is the sum of the agents' own counts.
+  const perAgentMode = state.distMode === 'per-agent';
+  const profiles = perAgentMode ? selectedAgents().map((a) => state.profiles[a] || cfg) : [cfg];
+  for (const tg of s.threadGroups) {
+    const ts = profiles.map((p) => (p.threadGroups || []).find((x) => x.id === tg.id))
+      .filter((t) => t && t.enabled && (!perAgentMode || (+t.threads || 0) > 0));
+    if (!ts.length) continue;
+    const t = ts[0];
+    const users = perAgentMode && !isSetupTg(tg)
+      ? ts.reduce((sum, x) => sum + (+x.threads || 0), 0)
+      : (t.threads != null ? t.threads : tg.threads);
+    out.groups.push({
+      name: tg.name, setup: isSetupTg(tg), rate: isRateTg(tg), editable: tg.editable,
+      users, rampUp: t.rampUp != null ? t.rampUp : tg.rampUp,
+      mode: t.mode, loops: t.loops, duration: t.duration, hold: t.hold,
+    });
+  }
+  const sm = cfg.samplers || [];
+  out.samplersOn = sm.filter((x) => profiles.some((p) => ((p.samplers || []).find((y) => y.id === x.id) || x).enabled)).length;
+  out.samplersTotal = sm.length;
+  // requests that will actually run: ticked, in a group that's on, and under no
+  // switched-off controller (same rule as the request tree's "X of Y will run")
+  const runsIn = (p) => {
+    const tgOn = new Map((p.threadGroups || []).map((t) => [t.id, t.enabled && (!perAgentMode || (+t.threads || 0) > 0)]));
+    const ctrlOn = new Map((p.controllers || []).map((c) => [c.id, c.enabled]));
+    const smOn = new Map((p.samplers || []).map((x) => [x.id, x.enabled]));
+    return (sm2) => smOn.get(sm2.id) !== false && sm2.threadGroupId != null && tgOn.get(sm2.threadGroupId)
+      && (sm2.ctrlIds || []).every((c) => ctrlOn.get(c) !== false);
+  };
+  const checks = profiles.map(runsIn);
+  out.willRun = s.samplers.filter((x) => checks.some((ok) => ok(x))).length;
+  if (perAgentMode) {
+    for (const a of selectedAgents()) {
+      out.perAgentUsers[a] = usersOf(state.profiles[a] || cfg);
+      out.users += out.perAgentUsers[a];
+    }
+  } else {
+    out.users = usersOf(cfg);
+  }
+  return out;
+}
+
+function updateWizSubs() {
+  if (!state.plan) {
+    $('wizSub1').textContent = 'Choose the test';
+    $('wizSub2').textContent = 'Users and ramp-up';
+    $('wizSub3').textContent = 'PCs and data files';
+    return;
+  }
+  const w = workloadSummary();
+  const n = selectedAgents().length;
+  const fileIssues = n ? new Set(dataFileIssues().map((i) => i.ref)).size : 0;
+  $('wizSub1').textContent = state.plan.name;
+  $('wizSub2').textContent = state.distMode === 'per-agent' ? 'Per-agent profiles' : `${fmt.n(w.users)} users · split evenly`;
+  $('wizSub3').textContent = !n ? 'None selected yet'
+    : `${n} agent${n === 1 ? '' : 's'}${fileIssues ? ` · ${fileIssues} file${fileIssues === 1 ? '' : 's'} to attach` : ''}`;
+}
+
+function renderRunSummary() {
+  const dl = $('runSummaryList');
+  if (!dl) return;
+  const rows = [];
+  if (!state.plan) {
+    rows.push(['Plan', 'Not chosen yet', 'muted']);
+  } else {
+    const w = workloadSummary();
+    const ag = selectedAgents();
+    const perAgent = state.distMode === 'per-agent';
+    rows.push(['Plan', state.plan.name]);
+    rows.push(['Load sharing', perAgent ? 'Per-agent profiles' : 'Split evenly']);
+    rows.push(['Virtual users', w.users ? fmt.n(w.users) : '—']);
+    rows.push(['Thread groups on', `${w.groups.length} of ${state.plan.structure.threadGroups.length}`]);
+    rows.push(['Agents', ag.length ? `${ag.length} selected` : 'None selected', ag.length ? '' : 'warn']);
+    if (ag.length && w.users && !perAgent) rows.push(['Users per agent', `≈ ${fmt.n(Math.ceil(w.users / ag.length))}`]);
+    const refs = (state.plan.structure.dataFileRefs || []).filter(csvRefNeeded);
+    if (refs.length) {
+      // ready = attached AND (for per-agent files) attached for every selected agent
+      const bad = new Set(dataFileIssues().map((i) => i.ref));
+      const have = refs.filter((r) => !bad.has(r.name) && (state.library || []).some((f) => f.logical === libKey(r.name))).length;
+      rows.push(['Data files', `${have} of ${refs.length} ready`, have < refs.length ? 'warn' : '']);
+    }
+  }
+  dl.innerHTML = rows.map(([k, v, cls]) => `<div><dt>${esc(k)}</dt><dd${cls ? ` class="${cls}"` : ''}>${esc(v)}</dd></div>`).join('');
+}
+
+function renderReview() {
+  const el = $('reviewBody');
+  if (!el || !state.plan) return;
+  if (state.distMode === 'per-agent') saveActiveProfile();
+  const p = state.plan;
+  const w = workloadSummary();
+  const ag = selectedAgents();
+  const n = ag.length || 1;
+  const perAgent = state.distMode === 'per-agent';
+  const perCol = (g) => {
+    if (g.setup) return `${fmt.n(g.users)} each`;
+    if (perAgent) return 'per profile';
+    if (g.rate) return `${+(g.users / n).toFixed(2)}/s each`;
+    return `≈ ${fmt.n(Math.ceil(g.users / n))} each`;
+  };
+  const runsFor = (g) => {
+    if (g.rate) return g.hold ? `hold ${g.hold} s` : '—';
+    if (!g.editable) return 'plan setting';
+    if (g.mode === 'duration') return `${fmt.n(g.duration)} s`;
+    return g.loops === -1 ? 'forever' : `${fmt.n(g.loops || 1)} loop${(g.loops || 1) === 1 ? '' : 's'}`;
+  };
+  const tgRows = w.groups.map((g) => `<tr><td>${esc(g.name)}</td>
+    <td class="num">${g.rate ? `${fmt.n(g.users)}/s` : fmt.n(g.users)}</td><td class="num">${perCol(g)}</td>
+    <td class="num">${g.rampUp != null ? `${fmt.n(g.rampUp)} s` : '—'}</td><td>${runsFor(g)}</td></tr>`).join('');
+  const vo = readVariableOverrides();
+  const nVar = Object.values(vo).reduce((a, b) => a + Object.keys(b).length, 0);
+  const refs = (p.structure.dataFileRefs || []).filter(csvRefNeeded);
+  // per-agent data files: show which file each agent will read, right on its chip
+  const perAgentFiles = refs.map((r) => (state.library || []).find((x) => x.logical === libKey(r.name))).filter((f) => f && f.mode === 'per-agent');
+  const fileOf = (a) => perAgentFiles.map((f) => {
+    const o = (f.perAgentOrig || {})[a.replace(/[^\w.-]/g, '_')];
+    let n = o ? o.name : 'no file';
+    try { n = decodeURIComponent(n); } catch { /* keep */ }
+    return n;
+  }).join(', ');
+  const chips = ag.map((a) => `<span class="rv-chip">${esc(a)}${perAgent ? ` · ${fmt.n(w.perAgentUsers[a] || 0)}` : ''}${perAgentFiles.length ? ` <span class="rv-chip-file">${esc(fileOf(a))}</span>` : ''}</span>`).join('');
+  el.innerHTML = `
+    <div class="rv-row">
+      <div class="rv-k">Plan</div>
+      <div class="rv-v"><b>${esc(p.name)}</b>
+        <div class="rv-sub">${esc(p.fileName || '')}${refs.length ? ` · data files: ${refs.map((r) => {
+          const f = (state.library || []).find((x) => x.logical === libKey(r.name));
+          const how = !f ? 'not attached' : f.mode === 'per-agent' ? 'a different file per agent' : f.mode === 'split' ? 'rows split across agents' : 'same file for every agent';
+          return `${esc(r.name)} (${how})`;
+        }).join(', ')}` : ''}</div></div>
+      <button type="button" class="link-btn" data-go="1">Edit</button>
+    </div>
+    <div class="rv-row">
+      <div class="rv-k">Workload</div>
+      <div class="rv-v"><b>${perAgent ? 'Per-agent profiles' : 'Split evenly'} · ${fmt.n(w.users)} virtual users</b>
+        ${w.groups.length ? `<table class="rv-table"><thead><tr><th>Thread group</th><th class="num">Total</th><th class="num">Per agent</th><th class="num">Ramp-up</th><th>Runs for</th></tr></thead><tbody>${tgRows}</tbody></table>` : '<div class="rv-sub warn">No thread group is switched on.</div>'}
+        <div class="rv-sub">${fmt.n(w.willRun)} of ${fmt.n(w.samplersTotal)} requests will run · ${nVar ? `${nVar} variable${nVar === 1 ? '' : 's'} changed` : 'no variables changed'} · heap ${esc($('heap').value)} per agent</div></div>
+      <button type="button" class="link-btn" data-go="2">Edit</button>
+    </div>
+    <div class="rv-row">
+      <div class="rv-k">Agents</div>
+      <div class="rv-v"><b>${ag.length ? `${ag.length} agent${ag.length === 1 ? '' : 's'}` : 'No agents selected'}</b>
+        <div class="rv-chips">${chips}</div>
+        ${$('splitPreview').textContent ? `<div class="rv-sub">${esc($('splitPreview').textContent)}</div>` : ''}</div>
+      <button type="button" class="link-btn" data-go="3">Edit</button>
+    </div>`;
+  el.querySelectorAll('[data-go]').forEach((b) => (b.onclick = () => wizGo(+b.dataset.go)));
+}
+
+// How one data file (a CSV slot the plan reads) reaches the selected agents.
+function dataFileChecks(ref, agents) {
+  const f = (state.library || []).find((x) => x.logical === libKey(ref.name));
+  const dec = (s) => { try { return decodeURIComponent(s || ''); } catch { return s || ''; } };
+  const size = (b) => (b ? (b < 10240 ? `${(b / 1024).toFixed(1)} KB` : `${Math.round(b / 1024)} KB`) : '');
+  if (!f) return [{ lvl: 'warn', title: `${ref.name} is not attached yet`, detail: 'Attach it under Data files in step 3' }];
+  if (f.mode === 'per-agent') {
+    const rows = agents.map((a) => {
+      const k = a.replace(/[^\w.-]/g, '_');
+      const orig = (f.perAgentOrig || {})[k];
+      return { agent: a, has: !!(f.perAgent || {})[k], file: orig ? dec(orig.name) : '', size: orig ? size(orig.bytes) : '', hash: (f.perAgentHash || {})[k] };
+    });
+    const missing = rows.filter((x) => !x.has);
+    const out = [{
+      lvl: missing.length ? 'warn' : 'ok',
+      title: `${ref.name} · a different file for each agent`,
+      detail: missing.length ? `No file yet for ${missing.map((x) => x.agent).join(', ')} — attach it under Data files in step 3` : '',
+      files: rows,
+    }];
+    // identical content on two agents = their virtual users read the same rows (same accounts)
+    const byHash = new Map();
+    rows.filter((x) => x.has && x.hash).forEach((x) => (byHash.get(x.hash) || byHash.set(x.hash, []).get(x.hash)).push(x));
+    for (const same of byHash.values()) {
+      if (same.length < 2) continue;
+      out.push({
+        lvl: 'warn',
+        title: `${same.map((x) => x.agent).join(' and ')} have the same ${ref.name}`,
+        detail: `Their files are identical (${same[0].file}), so their virtual users will use the same rows — the same accounts. Give each agent its own file if users must not overlap.`,
+      });
+    }
+    return out;
+  }
+  if (f.mode === 'split') {
+    return [{ lvl: 'ok', title: `${ref.name} · rows split across ${agents.length} agent${agents.length === 1 ? '' : 's'}`, detail: `${dec(f.origName)}${f.bytes ? ` · ${size(f.bytes)}` : ''} — each agent gets its own share of the rows, so users don't overlap` }];
+  }
+  return [{ lvl: 'ok', title: `${ref.name} · the same file for every agent`, detail: `${dec(f.origName)}${f.bytes ? ` · ${size(f.bytes)}` : ''}${agents.length > 1 ? ' — every agent reads all rows, so agents can use the same accounts at the same time' : ''}` }];
+}
+
+// Pre-flight: fleet state + the SAME validation Start uses (buildRunConfig), so
+// anything that would block the run is shown here before you press Start.
+function renderPreflight() {
+  const ul = $('preflightList');
+  if (!ul || !state.plan) return;
+  const items = [];
+  const ag = selectedAgents();
+  const info = ag.map((nm) => state.agents.find((a) => a.name === nm)).filter(Boolean);
+  if (!ag.length) {
+    items.push({ lvl: 'fail', title: 'No agents selected', detail: 'Pick at least one agent in step 3.' });
+  } else {
+    const busy = info.filter((a) => a.state !== 'idle');
+    items.push(busy.length
+      ? { lvl: 'fail', title: `${busy.length} selected agent${busy.length === 1 ? ' is' : 's are'} not idle`, detail: busy.map((a) => a.name).join(', ') }
+      : { lvl: 'ok', title: ag.length === 1 ? `${ag[0]} is connected and idle` : `All ${ag.length} selected agents are connected and idle`, detail: '' });
+    const notReady = info.filter((a) => !a.jmeterReady && !a.stub);
+    items.push(notReady.length
+      ? { lvl: 'warn', title: `JMeter will be downloaded on ${notReady.length} agent${notReady.length === 1 ? '' : 's'} first`, detail: `${notReady.map((a) => a.name).join(', ')} · the first run takes a little longer` }
+      : { lvl: 'ok', title: 'JMeter is ready on every selected agent', detail: '' });
+    const hot = info.filter((a) => a.res && a.res.cpu >= 80);
+    if (hot.length) items.push({ lvl: 'warn', title: `High CPU right now on ${hot.map((a) => a.name).join(', ')}`, detail: 'Results from a busy machine can be skewed' });
+  }
+  let blocking = null;
+  try { buildRunConfig(); } catch (e) { blocking = e.message; }
+  if (blocking && !items.some((i) => i.lvl === 'fail')) {
+    items.push({ lvl: 'fail', title: 'Not ready to start', detail: blocking });
+  } else if (!blocking) {
+    // One check per data file the plan reads: how it reaches the agents and, for
+    // per-agent files, WHICH file each agent gets (plus identical-file warnings).
+    const refs = (state.plan.structure.dataFileRefs || []).filter(csvRefNeeded);
+    if (!refs.length) items.push({ lvl: 'ok', title: 'No data files needed', detail: '' });
+    for (const r of refs) items.push(...dataFileChecks(r, ag));
+  }
+  const plugins = state.plan.structure.plugins || [];
+  if (plugins.length) items.push({ lvl: 'warn', title: 'The plan uses JMeter plugins', detail: `${plugins.map((x) => x.split('.').pop()).join(', ')} · the JMeter bundle must include them` });
+  const fails = items.filter((i) => i.lvl === 'fail').length;
+  const warns = items.filter((i) => i.lvl === 'warn').length;
+  const badge = $('preflightBadge');
+  badge.textContent = fails ? `${fails} to fix` : warns ? `Ready · ${warns} warning${warns === 1 ? '' : 's'}` : 'Ready to start';
+  badge.className = `pf-badge ${fails ? 'fail' : warns ? 'warn' : 'ok'}`;
+  const icon = { ok: '<path d="m5 12.5 4.5 4.5L19 7.5"/>', warn: '<path d="M12 7v6M12 17h.01"/>', fail: '<path d="M6 6l12 12M18 6 6 18"/>' };
+  ul.innerHTML = items.map((i) => `<li class="pf-${i.lvl}"><span class="pf-icon"><svg viewBox="0 0 24 24" aria-hidden="true">${icon[i.lvl]}</svg></span>
+    <span class="pf-body"><b>${esc(i.title)}</b>${i.detail ? `<small>${esc(i.detail)}</small>` : ''}
+      ${i.files ? `<span class="pf-files">${i.files.map((x) => `<span class="pf-file${x.has ? '' : ' missing'}"><b>${esc(x.agent)}</b><span aria-hidden="true">←</span><span class="mono">${x.has ? esc(x.file || 'file attached') : 'no file'}</span>${x.size ? `<span class="pf-size">${esc(x.size)}</span>` : ''}</span>`).join('')}</span>` : ''}</span></li>`).join('');
+  $('startBtn').disabled = fails > 0;
+}
+
+// ---- recent plans (step 1): newest upload of each plan, one click to load ----
+async function loadRecentPlans(force) {
+  if (!$('recentPlans')) return;
+  if (!recentPlansCache || force) {
+    try { recentPlansCache = await api('GET', '/api/plans'); } catch { recentPlansCache = []; }
+  }
+  renderRecentPlans();
+}
+function renderRecentPlans() {
+  const box = $('recentPlans');
+  if (!box || !recentPlansCache) return;
+  const seen = new Set();
+  const uniq = recentPlansCache.filter((p) => { const k = `${p.name}|${p.fileName}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  if (!uniq.length) { box.innerHTML = ''; return; }
+  if (!$('rpList')) {
+    box.innerHTML = `<div class="rp-head"><span>Or pick a recent plan</span>
+      <input type="search" id="rpFilter" placeholder="Filter plans…" aria-label="Filter recent plans"></div>
+      <div class="rp-list" id="rpList"></div>`;
+    $('rpFilter').oninput = renderRecentPlans;
+  }
+  const q = $('rpFilter').value.trim().toLowerCase();
+  const shown = uniq.filter((p) => !q || `${p.name} ${p.fileName}`.toLowerCase().includes(q)).slice(0, q ? 12 : 6);
+  const cur = state.plan && state.plan.id;
+  $('rpList').innerHTML = shown.map((p) => `<button type="button" class="rp-item${p.id === cur ? ' on' : ''}" data-plan="${esc(p.id)}" title="${esc(`${p.name}\n${p.fileName || ''}`)}">
+      <span class="rp-name">${esc(p.name)}</span><span class="rp-meta">${esc(fmt.dt(p.uploadedAt))} · ${esc(p.fileName || '')}</span></button>`).join('')
+    || '<span class="hint" style="margin:0">No plans match.</span>';
+  $('rpList').querySelectorAll('.rp-item').forEach((b) => (b.onclick = async () => {
+    b.classList.add('loading');
+    try {
+      const plan = await api('GET', `/api/plans/${encodeURIComponent(b.dataset.plan)}`);
+      drop.textContent = 'Drop a different .jmx to replace';
+      applyLoadedPlan(plan);
+    } catch (e) { $('wizHint').textContent = `Could not load that plan: ${e.message}`; }
+    b.classList.remove('loading');
+  }));
+}
+
+// Any edit anywhere in the New Run form refreshes the summary (and the review
+// + pre-flight when you're on the last step).
+let wizRefreshT = null;
+function scheduleWizRefresh() {
+  clearTimeout(wizRefreshT);
+  wizRefreshT = setTimeout(() => {
+    updateWizSubs();
+    renderRunSummary();
+    // a "can't continue" hint from step 3 goes away once the problem is fixed
+    if (state.wizStep === 3 && $('wizHint').textContent && selectedAgents().length && !dataFileIssues().length) $('wizHint').textContent = '';
+    if (state.wizStep === WIZ_STEPS) { renderReview(); renderPreflight(); }
+  }, 120);
+}
+$('view-new').addEventListener('input', scheduleWizRefresh);
+$('view-new').addEventListener('change', scheduleWizRefresh);
+
+$('wizNext').onclick = () => {
+  const n = state.wizStep;
+  if (n === 1 && !state.plan) { $('wizHint').textContent = 'Upload a .jmx file or pick a recent plan first.'; return; }
+  if (n === 3 && !selectedAgents().length) { $('wizHint').textContent = 'Select at least one agent to continue.'; return; }
+  if (n === 3) {
+    const issues = dataFileIssues();
+    if (issues.length) { $('wizHint').textContent = issues[0].msg; $('dataCard').scrollIntoView({ block: 'nearest', behavior: 'smooth' }); return; }
+  }
+  wizGo(n + 1);
+};
+$('wizBack').onclick = () => wizGo(state.wizStep - 1);
+document.querySelectorAll('#wizSteps .wiz-step-btn').forEach((b) => (b.onclick = () => wizGo(+b.dataset.step)));
+wizRender();
+loadRecentPlans();
+
 // ---------------- user defined variables (editable after load) ----------------
 
 // Show every enabled UDV block (Test Plan-level + nested) with editable values.
@@ -548,11 +1055,11 @@ function renderVariables() {
 function readVariableOverrides() {
   const all = (state.plan && state.plan.structure.variables) || [];
   const orig = {};
-  for (const b of all) for (const a of b.args) orig[`${b.id} ${a.name}`] = a.value;
+  for (const b of all) for (const a of b.args) orig[`${b.id}\u0000${a.name}`] = a.value;
   const out = {};
   document.querySelectorAll('#varsList .var-input').forEach((inp) => {
     const bid = inp.dataset.block, name = inp.dataset.name;
-    if (inp.value !== orig[`${bid} ${name}`]) (out[bid] || (out[bid] = {}))[name] = inp.value;
+    if (inp.value !== orig[`${bid}\u0000${name}`]) (out[bid] || (out[bid] = {}))[name] = inp.value;
   });
   return out;
 }
@@ -565,20 +1072,31 @@ $('addDataFile').onclick = () => { uploadCtx = { mode: 'shared' }; $('dataFile')
 
 $('dataFile').onchange = async () => {
   const ctx = uploadCtx || { mode: 'shared' };
-  for (const f of $('dataFile').files) {
-    const headers = {
-      'content-type': 'application/octet-stream',
-      'x-filename': ctx.logical || f.name,
-      'x-origname': encodeURIComponent(f.name),
-      'x-mode': ctx.mode,
-    };
-    if (ctx.agent) headers['x-agent'] = ctx.agent;
-    const d = await fetch('/api/library/files', { method: 'POST', headers, body: f }).then((r) => r.json());
-    if (d.files) state.library = d.files;
+  const failed = [];
+  try {
+    for (const f of $('dataFile').files) {
+      const headers = {
+        'content-type': 'application/octet-stream',
+        'x-filename': encodeURIComponent(ctx.logical || f.name),
+        'x-origname': encodeURIComponent(f.name),
+        'x-mode': ctx.mode,
+      };
+      if (ctx.agent) headers['x-agent'] = encodeURIComponent(ctx.agent);
+      try {
+        const res = await fetch('/api/library/files', { method: 'POST', headers, body: f });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+        if (d.files) state.library = d.files;
+      } catch (e) {
+        failed.push(`${f.name}: ${e.message}`);
+      }
+    }
+  } finally {
+    $('dataFile').value = ''; // so picking the same file again still uploads
+    uploadCtx = null;
+    renderDataFiles();
   }
-  $('dataFile').value = '';
-  uploadCtx = null;
-  renderDataFiles();
+  if (failed.length) alert(`Upload failed\n\n${failed.join('\n')}`);
 };
 
 async function patchDataFile(logical, patch) {
@@ -601,6 +1119,10 @@ function tgName(tgId) {
 }
 // A CSV file is only needed for this run if its config is enabled AND its
 // owning thread group is enabled (or it's a global/test-plan-level CSV).
+// The library stores each file under a SAFE name ("Login Users.csv" → "Login_Users.csv");
+// compare plan references in that same form, or names with spaces never match.
+const libKey = (name) => String(name || '').replace(/[^\w.-]/g, '_').replace(/^\.+/, (m) => '_'.repeat(m.length)) || '_';
+
 function csvRefNeeded(ref) {
   return ref.enabled && tgEnabledNow(ref.threadGroupId);
 }
@@ -612,6 +1134,7 @@ function csvRefNeeded(ref) {
  * options are tucked behind the row and only appear once a file is chosen.
  */
 function renderDataFiles() {
+  scheduleWizRefresh(); // attached/cleared files change the summary + review
   const files = state.library || [];
   const agents = selectedAgents();
   const byLogical = new Map(files.map((f) => [f.logical, f]));
@@ -623,15 +1146,25 @@ function renderDataFiles() {
   if ($('addDataFile')) $('addDataFile').style.display = 'none';
   if ($('dataFilesUi')) $('dataFilesUi').innerHTML = '';
 
-  if (!refs.length) { $('csvRefs').innerHTML = ''; return; }
+  $('dataCard').hidden = !refs.length;
+  if (!refs.length) { $('csvRefs').innerHTML = ''; $('dataNote').hidden = true; return; }
 
   const needed = refs.filter(csvRefNeeded);
-  const skipped = refs.filter((r) => !csvRefNeeded(r) && !byLogical.has(r.name));
+  const skipped = refs.filter((r) => !csvRefNeeded(r) && !byLogical.has(libKey(r.name)));
+
+  // Step 1 only points ahead: a per-agent file can't be attached before the
+  // agents are chosen, so the whole data-file setup lives in step 3.
+  const names = needed.map((r) => `<b>${esc(r.name)}</b>`).join(', ');
+  const allAttached = needed.length && needed.every((r) => byLogical.has(libKey(r.name)));
+  $('dataNote').hidden = !needed.length;
+  $('dataNote').innerHTML = allAttached
+    ? `${ic('check')} This plan reads ${names} — already attached. You can review or change ${needed.length === 1 ? 'it' : 'them'} in step 3, next to the agents.`
+    : `This plan reads ${needed.length === 1 ? 'a data file' : `${needed.length} data files`}: ${names}. You’ll attach ${needed.length === 1 ? 'it' : 'them'} in <b>step 3</b>, after choosing which agents run the test.`;
 
   const dec = (s) => { try { return decodeURIComponent(s || ''); } catch { return s || ''; } };
   const kb = (b) => b ? ` (${b < 10240 ? (b / 1024).toFixed(1) : Math.round(b / 1024)} KB)` : '';
   const rowHtml = (ref) => {
-    const f = byLogical.get(ref.name);
+    const f = byLogical.get(libKey(ref.name));
     const ok = !!f;
     // Lead with the FILE THE USER PICKED (filename doesn't matter for delivery,
     // but that's what they recognise). The plan's internal slot name is shown
@@ -658,7 +1191,7 @@ function renderDataFiles() {
         return `<button class="csv-agent-chip ${has ? 'has' : 'need'}" data-logical="${esc(ref.name)}" data-agent="${esc(a)}"
           title="${has ? 'Click to replace · file: ' + esc(nm) : 'Click to upload this agent’s file'}">
           ${has ? '✓' : ic('upload')} ${esc(a)}${has && nm ? ` <span class="csv-agent-file">${esc(nm)}</span>` : has ? '' : ' <span class="csv-agent-file need">needs file</span>'}</button>`;
-      }).join('') : '<span class="hint" style="margin:0">select agents in step 3 first</span>';
+      }).join('') : '<span class="hint" style="margin:0">Select agents above first — then click each agent to attach its file.</span>';
       perAgentRow = `<div class="csv-agent-row">${chips}</div>`;
     }
 
@@ -698,7 +1231,7 @@ function renderDataFiles() {
   // choose/replace a file for a slot — stored under the plan's expected name
   document.querySelectorAll('.csv-up').forEach((btn) => btn.onclick = () => {
     const logical = btn.dataset.logical;
-    const existing = byLogical.get(logical);
+    const existing = byLogical.get(libKey(logical));
     uploadCtx = { mode: existing ? existing.mode : 'shared', logical };
     $('dataFile').click();
   });
@@ -730,82 +1263,199 @@ function renderDataFiles() {
 
 // ---------------- new run: config form ----------------
 
-/**
- * Sampler checkboxes grouped under their parent controllers (the tree the
- * JMeter GUI shows: Simple/Transaction/If controllers etc.). Plans without
- * controllers render as the plain flat grid.
- */
-// A read-only badge row for CSV Data Set Config / pre / post processors.
-function auxRowHtml(a) {
-  const meta = a.role === 'csv'
-    ? { badge: 'CSV', cls: 'aux-csv', title: 'CSV Data Set Config' }
-    : (a.role === 'pre'
-      ? { badge: 'PRE', cls: 'aux-pre', title: 'Pre-processor' }
-      : { badge: 'POST', cls: 'aux-post', title: 'Post-processor' });
-  const file = a.role === 'csv' && a.file ? ` <span class="aux-file">${esc(a.file)}</span>` : '';
-  return `<div class="aux-row ${meta.cls}${a.enabled ? '' : ' aux-off'}" title="${esc(meta.title)} · ${esc(a.tag)}"><span class="aux-badge">${meta.badge}</span> ${esc(a.name)}${file}</div>`;
+// ---- step 2: the request tree (controllers ▸ requests ▸ the helpers of each request) ----
+// Same checkboxes as before (smEn-<id> per sampler, .ctrlCb per controller), so
+// reading/writing the run config is unchanged; only the layout is new.
+
+const ROLE_LABEL = {
+  pre: ['Before', 'r-pre'], extract: ['Extracts', 'r-ext'], check: ['Checks', 'r-chk'],
+  post: ['After', 'r-post'], csv: ['Reads', 'r-csv'],
+};
+
+// "100-----STATIC PAGES--------" → "100 · STATIC PAGES" (the plan's name stays in the tooltip)
+function prettyCtrlName(n) {
+  const p = String(n || '').replace(/\s*[-_=~*.]{3,}\s*/g, ' · ').replace(/^[\s·]+|[\s·]+$/g, '').trim();
+  return p || String(n || '');
 }
 
-function samplerGroupsHtml(tg, samplers) {
-  const ctrls = state.plan.structure.controllers || [];
-  const aux = (state.plan.structure.aux || []).filter((a) => a.threadGroupId === tg.id);
-  const label = (sm) => `<label data-name="${esc(sm.name.toLowerCase())}"><input type="checkbox" class="smCb-${tg.id}" id="smEn-${sm.id}" ${sm.enabled ? 'checked' : ''}> ${esc(sm.name)}</label>`;
-  const renderItem = (it) => (it._aux ? auxRowHtml(it) : label(it));
-  // Group samplers AND aux elements by their controller path, ordered by document seq.
-  const groups = new Map();
-  const push = (ctrlIds, item, isAux) => {
-    const key = (ctrlIds || []).join('/');
-    if (!groups.has(key)) groups.set(key, { ctrlIds: ctrlIds || [], items: [] });
-    groups.get(key).items.push(isAux ? { ...item, _aux: true } : item);
-  };
-  for (const sm of samplers) push(sm.ctrlIds, sm, false);
-  for (const a of aux) push(a.ctrlIds, a, true);
-  for (const g of groups.values()) g.items.sort((x, y) => (x.seq || 0) - (y.seq || 0));
-  if (groups.size === 1 && groups.has('')) {
-    return `<div class="samplers" id="smList-${tg.id}">${groups.get('').items.map(renderItem).join('')}</div>`;
+// One helper (extractor, assertion, pre/post processor, CSV) — as a line under its request…
+function helperHtml(a) {
+  const [label, cls] = ROLE_LABEL[a.role] || ['Uses', 'r-post'];
+  const main = a.role === 'csv' ? (a.file || a.name) : (a.detail || a.name);
+  const sub = a.role === 'csv' ? a.name : a.type && a.type !== main ? a.type : '';
+  return `<div class="rt-help${a.enabled ? '' : ' off'}" title="${esc(a.name)}${a.type ? ` · ${esc(a.type)}` : ''}">
+    <span class="rt-elbow" aria-hidden="true"></span>
+    <span class="rt-role ${cls}">${label}</span>
+    <span class="rt-hname${a.role === 'extract' || a.role === 'csv' ? ' mono' : ''}">${esc(main)}</span>
+    ${sub ? `<span class="rt-htype">${esc(sub)}</span>` : ''}
+    ${a.enabled ? '' : '<span class="rt-hoff">· off in plan</span>'}
+  </div>`;
+}
+// …or as a chip on a "applies to every request here" strip.
+function helperChip(a) {
+  const [label, cls] = ROLE_LABEL[a.role] || ['Uses', 'r-post'];
+  const main = a.role === 'csv' ? (a.file || a.name) : (a.detail || a.name);
+  const sub = a.role === 'csv' ? a.name : a.type && a.type !== main ? a.type : '';
+  return `<span class="rt-chip${a.enabled ? '' : ' off'}" title="${esc(a.name)}${a.type ? ` · ${esc(a.type)}` : ''}">
+    <span class="rt-role ${cls}">${label}</span><span class="rt-hname${a.role === 'extract' || a.role === 'csv' ? ' mono' : ''}">${esc(main)}</span>${sub ? `<span class="rt-htype">${esc(sub)}</span>` : ''}${a.enabled ? '' : '<span class="rt-hoff">· off in plan</span>'}</span>`;
+}
+function scopeStripHtml(list, label, cls = '') {
+  return list.length ? `<div class="rt-scope ${cls}"><span class="rt-scope-k">${label}</span>${list.map(helperChip).join('')}</div>` : '';
+}
+
+const CHEVRON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>';
+const FOLDER = '<svg class="rt-folder" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+
+// JMeter runs a request's helpers in this order: pre-processors, the request,
+// post-processors/extractors, then assertions — list them the same way.
+const HELPER_PHASE = { csv: 0, pre: 1, extract: 2, post: 2, check: 3 };
+
+function requestTreeHtml(tg, samplers) {
+  const s = state.plan.structure;
+  const ctrls = (s.controllers || []).filter((c) => c.threadGroupId === tg.id);
+  const aux = (s.aux || []).filter((a) => a.threadGroupId === tg.id);
+  const bySampler = new Map(), byCtrl = new Map(), tgScope = [];
+  for (const a of aux) {
+    const last = a.ctrlIds && a.ctrlIds.length ? a.ctrlIds[a.ctrlIds.length - 1] : null;
+    if (a.samplerId != null) (bySampler.get(a.samplerId) || bySampler.set(a.samplerId, []).get(a.samplerId)).push(a);
+    else if (last != null) (byCtrl.get(last) || byCtrl.set(last, []).get(last)).push(a);
+    else tgScope.push(a);
   }
-  let gi = 0;
-  return `<div class="sm-groups" id="smList-${tg.id}">${[...groups.values()].map((g) => {
-    const id = `cg-${tg.id}-${gi++}`;
-    const ids = g.ctrlIds;
-    const inner = ids.length ? ids[ids.length - 1] : null;
-    // EVERY controller in the path gets a checkbox — including ancestors like a
-    // parent "Q&A Service" that has no direct samplers — so any of them can be
-    // (re-)enabled, exactly like ticking it in the JMeter tree. A disabled parent
-    // stops its children from running even when they're ticked.
-    const head = inner === null
-      ? '<span class="ctrl-name">— directly under thread group —</span>'
-      : ids.map((cid) => `<label class="ctrl-toggle"><input type="checkbox" class="ctrlCb" data-ctrl="${cid}" data-tg="${tg.id}" ${ctrls[cid] && ctrls[cid].enabled ? 'checked' : ''}> ${esc(ctrls[cid] ? ctrls[cid].name : '?')}</label>`).join('<span class="ctrl-sep">›</span>');
-    return `
-    <div class="ctrl-group" id="${id}" data-ctrlids="${ids.join('/')}">
-      <div class="ctrl-head">
-        ${head}
-        <span class="ctrl-off" style="display:none">controller disabled — these samplers won’t run</span>
-        <span class="ctrl-actions">
-          <button class="ghost mini" data-cgtarget="${id}" data-cgtg="${tg.id}" data-on="1">All</button>
-          <button class="ghost mini" data-cgtarget="${id}" data-cgtg="${tg.id}" data-on="0">None</button>
+  const parentOf = (x) => (x.ctrlIds && x.ctrlIds.length ? x.ctrlIds[x.ctrlIds.length - 1] : null);
+  const kidsOf = (cid) => [
+    ...ctrls.filter((c) => parentOf(c) === cid).map((c) => ({ c, seq: c.seq })),
+    ...samplers.filter((sm) => parentOf(sm) === cid).map((sm) => ({ sm, seq: sm.seq })),
+  ].sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  // big thread groups open with their controllers folded, so the outline fits on screen
+  const startOpen = samplers.length <= 60;
+  const node = (it, d) => (it.c ? ctrlHtml(it.c, d) : reqHtml(it.sm, d));
+  const ctrlHtml = (c, d) => {
+    const nm = prettyCtrlName(c.name);
+    const open = startOpen || d > 0;
+    return `<div class="rt-ctrl${open ? '' : ' collapsed'}" data-ctrl="${c.id}" style="--d:${d}">
+      <div class="rt-row rt-crow">
+        <button type="button" class="rt-chev" aria-expanded="${open}" aria-label="${open ? 'Collapse' : 'Expand'} ${esc(nm)}">${CHEVRON}</button>
+        <label class="rt-clabel" title="${esc(c.name)}"><input type="checkbox" class="ctrlCb" data-ctrl="${c.id}" data-tg="${tg.id}" ${c.enabled ? 'checked' : ''}>${FOLDER}
+          <span class="rt-ctext"><b class="rt-cname">${esc(nm)}</b><small class="rt-csub"></small></span></label>
+        <span class="rt-offpill" hidden>Off in plan · its requests won’t run</span>
+        <span class="rt-actions">
+          <button type="button" class="ghost mini rt-all" data-on="1" aria-label="Tick every request in ${esc(nm)}">All</button>
+          <button type="button" class="ghost mini rt-all" data-on="0" aria-label="Untick every request in ${esc(nm)}">None</button>
         </span>
       </div>
-      <div class="samplers">${g.items.map(renderItem).join('')}</div>
+      <div class="rt-kids">
+        ${scopeStripHtml(byCtrl.get(c.id) || [], 'Every request in this group', 'rt-scope-ctrl')}
+        ${kidsOf(c.id).map((k) => node(k, d + 1)).join('')}
+      </div>
     </div>`;
-  }).join('')}</div>`;
+  };
+  const reqHtml = (sm, d) => `<div class="rt-req" data-name="${esc(sm.name.toLowerCase())}" style="--d:${d}">
+      <div class="rt-row rt-rrow">
+        <label class="rt-rlabel"><input type="checkbox" class="smCb-${tg.id}" id="smEn-${sm.id}" ${sm.enabled ? 'checked' : ''}>
+          <span class="rt-method">${esc(sm.method || 'Req')}</span><span class="rt-name">${esc(sm.name)}</span></label>
+        <span class="rt-wont" hidden>Ticked, but its controller is off</span>
+      </div>
+      ${(bySampler.get(sm.id) || []).slice().sort((x, y) => (HELPER_PHASE[x.role] - HELPER_PHASE[y.role]) || (x.seq - y.seq)).map(helperHtml).join('')}
+    </div>`;
+  return `${scopeStripHtml(tgScope, 'Every request in this thread group', 'rt-scope-tg')}
+    <div class="rt" id="smList-${tg.id}">${kidsOf(null).map((k) => node(k, 0)).join('')}</div>`;
 }
 
-/** Dim every group that sits under a disabled controller (any ancestor unchecked). */
+// Refresh on/off state, counts and "won't run" hints after any tick.
+// (Named updateCtrlDim because applyFormConfig and friends already call it.)
 function updateCtrlDim(tgId) {
-  const ctrls = state.plan.structure.controllers || [];
-  const isOn = (id) => {
-    const cb = document.querySelector(`.ctrlCb[data-ctrl="${id}"]`);
-    return cb ? cb.checked : (ctrls[id] ? ctrls[id].enabled : true);
+  const root = $(`smList-${tgId}`);
+  if (!root) return;
+  const ownCb = (ctrlEl) => ctrlEl.querySelector(':scope > .rt-crow .ctrlCb');
+  const offAncestor = (el) => {
+    for (let p = el.parentElement && el.parentElement.closest('.rt-ctrl'); p; p = p.parentElement && p.parentElement.closest('.rt-ctrl')) {
+      if (!ownCb(p).checked) return p;
+    }
+    return null;
   };
-  document.querySelectorAll(`#smList-${tgId} .ctrl-group`).forEach((g) => {
-    const ids = (g.dataset.ctrlids || '').split('/').filter(Boolean).map(Number);
-    const off = ids.some((id) => !isOn(id));
-    g.classList.toggle('ctrl-disabled', off);
-    const warn = g.querySelector('.ctrl-off');
-    if (warn) warn.style.display = off ? '' : 'none';
+  root.querySelectorAll('.rt-ctrl').forEach((el) => {
+    const on = ownCb(el).checked;
+    const anc = offAncestor(el);
+    el.classList.toggle('off', !on);
+    el.classList.toggle('inactive', !!anc);
+    el.querySelector(':scope > .rt-crow .rt-offpill').hidden = on;
+    const cbs = [...el.querySelectorAll(`.smCb-${tgId}`)];
+    const ticked = cbs.filter((c) => c.checked).length;
+    el.querySelector(':scope > .rt-crow .rt-csub').textContent =
+      `${cbs.length} request${cbs.length === 1 ? '' : 's'} · ${ticked} ticked` +
+      (anc ? ` · inside “${anc.querySelector(':scope > .rt-crow .rt-cname').textContent}”, which is off` : '');
   });
+  let willRun = 0;
+  const all = root.querySelectorAll('.rt-req');
+  all.forEach((el) => {
+    const cb = el.querySelector(`.smCb-${tgId}`);
+    const own = el.closest('.rt-ctrl');
+    const live = !own || (ownCb(own).checked && !offAncestor(own));
+    el.classList.toggle('inactive', !live);
+    el.querySelector('.rt-wont').hidden = !(cb.checked && !live);
+    if (cb.checked && live) willRun++;
+  });
+  const cnt = $(`smCount-${tgId}`);
+  if (cnt) cnt.textContent = `${willRun} of ${all.length} will run`;
 }
+
+// Type-to-find: hide non-matching requests (and controllers left empty), open the rest.
+function filterTree(tgId, q) {
+  const root = $(`smList-${tgId}`);
+  if (!root) return;
+  q = q.trim().toLowerCase();
+  root.classList.toggle('filtering', !!q);
+  root.querySelectorAll('.rt-req').forEach((el) => el.classList.toggle('hidden', !!q && !el.dataset.name.includes(q)));
+  root.querySelectorAll('.rt-ctrl').forEach((el) => el.classList.toggle('hidden', !!q && !el.querySelector('.rt-req:not(.hidden)')));
+  const empty = root.parentElement.querySelector('.rt-nomatch');
+  if (empty) empty.hidden = !q || !!root.querySelector('.rt-req:not(.hidden)');
+}
+
+function wireTree(tg) {
+  const root = $(`smList-${tg.id}`);
+  if (!root) return;
+  const refresh = () => {
+    updateCtrlDim(tg.id);
+    if (state.distMode === 'per-agent') renderPerAgentSummary();
+  };
+  root.querySelectorAll(`.smCb-${tg.id}`).forEach((cb) => (cb.onchange = refresh));
+  root.querySelectorAll('.ctrlCb').forEach((cb) => (cb.onchange = refresh));
+  root.querySelectorAll('.rt-chev').forEach((b) => (b.onclick = () => {
+    const el = b.closest('.rt-ctrl');
+    const open = el.classList.toggle('collapsed') === false;
+    b.setAttribute('aria-expanded', String(open));
+    b.setAttribute('aria-label', `${open ? 'Collapse' : 'Expand'} ${el.querySelector('.rt-cname').textContent}`);
+  }));
+  root.querySelectorAll('.rt-all').forEach((b) => (b.onclick = () => {
+    b.closest('.rt-ctrl').querySelectorAll(`.rt-req:not(.hidden) .smCb-${tg.id}`).forEach((cb) => { cb.checked = b.dataset.on === '1'; });
+    refresh();
+  }));
+  const card = $(`tg-${tg.id}`);
+  const f = $(`smFilter-${tg.id}`);
+  if (f) f.oninput = () => filterTree(tg.id, f.value);
+  card.querySelectorAll('[data-small]').forEach((b) => (b.onclick = () => {
+    root.querySelectorAll(`.rt-req:not(.hidden) .smCb-${tg.id}`).forEach((cb) => { cb.checked = b.dataset.on === '1'; });
+    refresh();
+  }));
+  card.querySelectorAll('[data-rtfold]').forEach((b) => (b.onclick = () => {
+    const open = b.dataset.rtfold === 'open';
+    root.querySelectorAll('.rt-ctrl').forEach((el) => {
+      el.classList.toggle('collapsed', !open);
+      const chev = el.querySelector(':scope > .rt-crow .rt-chev');
+      chev.setAttribute('aria-expanded', String(open));
+      chev.setAttribute('aria-label', `${open ? 'Collapse' : 'Expand'} ${el.querySelector('.rt-cname').textContent}`);
+    });
+  }));
+  updateCtrlDim(tg.id);
+}
+
+const RT_LEGEND = `<div class="rt-legend">
+  <span><span class="rt-role r-pre">Before</span>runs just before its request</span>
+  <span><span class="rt-role r-ext">Extracts</span>saves a value from the response</span>
+  <span><span class="rt-role r-chk">Checks</span>passes or fails the request</span>
+  <span><span class="rt-role r-post">After</span>runs after its request</span>
+  <span><span class="rt-role r-csv">Reads</span>takes test data from a file</span>
+</div>`;
 
 // ---- form <-> config profile (reused for split mode and per-agent profiles) ----
 
@@ -836,7 +1486,9 @@ function readFormConfig() {
         duration: mode === 'duration' ? val : undefined,
       };
     }),
-    samplers: s.samplers.map((sm) => ({ id: sm.id, enabled: $(`smEn-${sm.id}`).checked })),
+    // Samplers outside every thread group (e.g. inside a Test Fragment used by a
+    // Module Controller) have no checkbox — keep the plan's own setting for them.
+    samplers: s.samplers.map((sm) => { const cb = $(`smEn-${sm.id}`); return { id: sm.id, enabled: cb ? cb.checked : sm.enabled }; }),
     controllers: (s.controllers || []).map((c) => {
       const cb = document.querySelector(`.ctrlCb[data-ctrl="${c.id}"]`);
       return { id: c.id, enabled: cb ? cb.checked : c.enabled };
@@ -875,20 +1527,14 @@ function applyFormConfig(cfg) {
     const cb = document.querySelector(`.ctrlCb[data-ctrl="${c.id}"]`);
     if (cb && x) cb.checked = x.enabled;
   }
-  s.threadGroups.forEach((tg) => {
-    updateCtrlDim(tg.id);
-    const cbs = [...document.querySelectorAll(`.smCb-${tg.id}`)];
-    const el = $(`smCount-${tg.id}`);
-    if (el) el.textContent = `${cbs.filter((c) => c.checked).length} / ${cbs.length} enabled`;
-  });
+  s.threadGroups.forEach((tg) => updateCtrlDim(tg.id)); // tree states + counts
 }
 
-// Save whatever's on screen into the currently-edited agent's profile.
-function saveActiveProfile() {
-  if (state.distMode === 'per-agent' && state.editingAgent) {
-    state.profiles[state.editingAgent] = readFormConfig();
-  }
-}
+// Per-agent profiles are edited in the per-agent grid, which writes straight into
+// state.profiles. The classic form is hidden in that mode, so it must NEVER be
+// copied over a profile (that silently replaced the first agent's grid edits).
+// Kept as a no-op hook for the callers that "save before reading".
+function saveActiveProfile() {}
 
 // The load profile for a bzm rate/concurrency group: a staircase from 0 up to
 // the target over `ramp` seconds in `steps` steps, then held flat for `hold`.
@@ -997,9 +1643,7 @@ function renderConfig() {
   const s = state.plan.structure;
   // Test-plan-level CSV / processors (not inside any thread group) — shown once on top.
   const planAux = (s.aux || []).filter((a) => a.threadGroupId === null);
-  const planAuxHtml = planAux.length
-    ? `<div class="tg plan-aux"><div class="tg-head"><span>Plan-level configuration</span><span class="tg-tag">shared by all thread groups</span></div><div class="samplers">${planAux.map(auxRowHtml).join('')}</div></div>`
-    : '';
+  const planAuxHtml = scopeStripHtml(planAux, 'Every thread group in this plan', 'rt-scope-plan');
   $('tgList').innerHTML = planAuxHtml + s.threadGroups.map((tg) => {
     const samplers = s.samplers.filter((x) => x.threadGroupId === tg.id);
     const editable = tg.editable;
@@ -1014,17 +1658,21 @@ function renderConfig() {
       </div>
       ${editable ? tgFieldsHtml(tg) : ''}
       ${samplers.length ? `
-      <details ${many ? '' : 'open'}>
-        <summary>Samplers <span class="badge" id="smCount-${tg.id}">${enabledCount} / ${samplers.length} enabled</span></summary>
-        <div class="sampler-tools">
-          <button class="ghost mini" data-small="${tg.id}" data-on="1">Select all</button>
-          <button class="ghost mini" data-small="${tg.id}" data-on="0">Select none</button>
-          ${many ? `<input type="search" id="smFilter-${tg.id}" placeholder="Filter ${samplers.length} samplers…">` : ''}
+      <details open class="rt-details">
+        <summary>Requests <span class="badge" id="smCount-${tg.id}">${enabledCount} of ${samplers.length}</span></summary>
+        <div class="sampler-tools rt-tools">
+          ${many ? `<input type="search" id="smFilter-${tg.id}" placeholder="Find one of ${samplers.length} requests…" aria-label="Find a request in ${esc(tg.name)}">` : ''}
+          <button type="button" class="ghost mini" data-small="${tg.id}" data-on="1">Tick all</button>
+          <button type="button" class="ghost mini" data-small="${tg.id}" data-on="0">Untick all</button>
+          ${(s.controllers || []).some((c) => c.threadGroupId === tg.id) ? `
+          <button type="button" class="ghost mini" data-rtfold="open">Expand all</button>
+          <button type="button" class="ghost mini" data-rtfold="close">Collapse all</button>` : ''}
         </div>
-        ${samplerGroupsHtml(tg, samplers)}
+        ${requestTreeHtml(tg, samplers)}
+        <p class="rt-nomatch" hidden>No request matches that search.</p>
       </details>` : ''}
     </div>`;
-  }).join('');
+  }).join('') + ((s.aux || []).length ? RT_LEGEND : '');
 
   s.threadGroups.forEach((tg) => {
     $(`tgEn-${tg.id}`).onchange = (e) => {
@@ -1043,77 +1691,177 @@ function renderConfig() {
       });
     }
 
-    const updateCount = () => {
-      const cbs = [...document.querySelectorAll(`.smCb-${tg.id}`)];
-      const el = $(`smCount-${tg.id}`);
-      if (el) el.textContent = `${cbs.filter((c) => c.checked).length} / ${cbs.length} enabled`;
-    };
-    document.querySelectorAll(`.smCb-${tg.id}`).forEach((cb) => (cb.onchange = updateCount));
-    const filter = $(`smFilter-${tg.id}`);
-    if (filter) filter.oninput = () => {
-      const q = filter.value.toLowerCase();
-      document.querySelectorAll(`#smList-${tg.id} label`).forEach((l) => {
-        l.classList.toggle('hidden', q && !l.dataset.name.includes(q));
-      });
-      // hide controller groups whose samplers are all filtered out
-      document.querySelectorAll(`#smList-${tg.id} .ctrl-group`).forEach((g) => {
-        g.classList.toggle('hidden', ![...g.querySelectorAll('label')].some((l) => !l.classList.contains('hidden')));
-      });
-    };
+    wireTree(tg); // tick / fold / find / All-None for this group's request tree
   });
+}
 
-  // Per-controller All/None — affects only that controller's visible samplers.
-  document.querySelectorAll('[data-cgtarget]').forEach((btn) => {
-    btn.onclick = () => {
-      document.getElementById(btn.dataset.cgtarget)
-        .querySelectorAll('.samplers label:not(.hidden) input')
-        .forEach((cb) => { cb.checked = btn.dataset.on === '1'; });
-      const first = document.querySelector(`.smCb-${btn.dataset.cgtg}`);
-      if (first) first.onchange();
-    };
+// The agents the user deliberately chose (null = no choice yet → every idle agent).
+// Busy/offline agents can't be ticked, so they're remembered here rather than read
+// back from the checkboxes — otherwise agents busy in the last run would come back
+// unticked once they're idle again.
+state.agentChoice = null;
+function recordAgentChoice() {
+  const next = new Set(selectedAgents());
+  document.querySelectorAll('.agentCb:disabled').forEach((cb) => {
+    if (!state.agentChoice || state.agentChoice.has(cb.value)) next.add(cb.value);
   });
-
-  // Controller enable/disable checkboxes — re-dim affected groups live. A
-  // controller can appear in several breadcrumbs (as an ancestor), so sync all
-  // copies of it before re-dimming.
-  document.querySelectorAll('.ctrlCb').forEach((cb) => {
-    cb.onchange = () => {
-      document.querySelectorAll(`.ctrlCb[data-ctrl="${cb.dataset.ctrl}"]`).forEach((x) => { x.checked = cb.checked; });
-      updateCtrlDim(cb.dataset.tg);
-      if (state.distMode === 'per-agent') renderPerAgentSummary();
-    };
-  });
-  s.threadGroups.forEach((tg) => updateCtrlDim(tg.id));
-
-  // Select all / none — only affects samplers currently visible under the filter.
-  document.querySelectorAll('[data-small]').forEach((btn) => {
-    btn.onclick = () => {
-      const tgId = btn.dataset.small;
-      document.querySelectorAll(`#smList-${tgId} label:not(.hidden) input`).forEach((cb) => { cb.checked = btn.dataset.on === '1'; });
-      const first = document.querySelector(`.smCb-${tgId}`);
-      if (first) first.onchange();
-    };
-  });
+  state.agentChoice = next;
 }
 
 function renderAgentPick() {
   if (!state.plan) return;
+  // Keep the user's selection when the agent list refreshes (an agent connecting,
+  // disconnecting or finishing a run must not silently change step 3).
+  const isOn = (a) => a.state === 'idle' && (state.agentChoice ? state.agentChoice.has(a.name) : true);
   $('agentPick').innerHTML = state.agents.length
     ? state.agents.map((a) => `
       <label>
-        <input type="checkbox" class="agentCb" value="${esc(a.name)}" ${a.state === 'idle' ? 'checked' : 'disabled'}>
-        <span><b>${esc(a.name)}</b><br><span class="meta">${a.cpus} cores · ${a.memGB} GB · ${a.state}${a.stub ? ' · STUB' : ''}</span><br>${resMeter(a.res, a.name)}</span>
+        <input type="checkbox" class="agentCb" value="${esc(a.name)}" ${a.state !== 'idle' ? 'disabled' : isOn(a) ? 'checked' : ''}>
+        <span><b>${esc(a.name)}</b><br><span class="meta">${Number(a.cpus) || 0} cores · ${Number(a.memGB) || 0} GB · ${esc(a.state)}${a.stub ? ' · STUB' : ''}</span><br>${resMeter(a.res, a.name)}</span>
       </label>`).join('')
     : '<span class="empty">No agents connected — start the agent exe on your worker PCs.</span>';
-  document.querySelectorAll('.agentCb').forEach((cb) => (cb.onchange = () => { renderSplitPreview(); renderDataFiles(); renderReportAssign(); updateDistUI(); }));
+  document.querySelectorAll('.agentCb').forEach((cb) => (cb.onchange = () => { recordAgentChoice(); afterAgentSelChange(); }));
+  populateTeamSelect();
   renderSplitPreview();
   renderDataFiles();
   updateDistUI();
+  scheduleWizRefresh();
 }
+
+function afterAgentSelChange() { renderSplitPreview(); renderDataFiles(); renderReportAssign(); updateDistUI(); scheduleWizRefresh(); }
 
 function selectedAgents() {
   return [...document.querySelectorAll('.agentCb:checked')].map((c) => c.value);
 }
+
+// ---- New Run: select all / none + load a saved team ----
+function populateTeamSelect() {
+  const sel = $('loadTeamSel');
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— load a team —</option>' +
+    (state.teams || []).map((t) => `<option value="${esc(t.id)}">${esc(t.name)} (${t.agents.length})</option>`).join('');
+  if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+}
+if ($('agentSelectAll')) $('agentSelectAll').onclick = () => {
+  document.querySelectorAll('.agentCb:not(:disabled)').forEach((cb) => { cb.checked = true; });
+  state.agentChoice = null; // "all" — including agents that become idle later
+  afterAgentSelChange();
+};
+if ($('agentUnselectAll')) $('agentUnselectAll').onclick = () => {
+  document.querySelectorAll('.agentCb').forEach((cb) => { cb.checked = false; });
+  state.agentChoice = new Set();
+  afterAgentSelChange();
+};
+if ($('loadTeamSel')) $('loadTeamSel').onchange = () => {
+  const id = $('loadTeamSel').value;
+  if (!id) { $('teamLoadNote').textContent = ''; return; }
+  const team = (state.teams || []).find((t) => t.id === id);
+  if (!team) return;
+  const want = new Set(team.agents);
+  const present = new Set();
+  let offline = 0;
+  document.querySelectorAll('.agentCb').forEach((cb) => {
+    present.add(cb.value);
+    if (want.has(cb.value)) { if (cb.disabled) { offline++; cb.checked = false; } else cb.checked = true; }
+    else cb.checked = false;
+  });
+  const absent = team.agents.filter((a) => !present.has(a));
+  state.agentChoice = want; // busy team members get ticked once they're idle
+  afterAgentSelChange();
+  const notes = [];
+  if (offline) notes.push(`${offline} busy/not-idle`);
+  if (absent.length) notes.push(`${absent.length} not connected: ${absent.join(', ')}`);
+  $('teamLoadNote').textContent = notes.length ? `⚠ ${notes.join(' · ')}` : `✓ loaded "${team.name}"`;
+};
+
+// ---------------- Team view: create / edit named agent groups ----------------
+async function loadTeamView() {
+  try { state.teams = await api('GET', '/api/teams'); } catch { state.teams = []; }
+  if (!state.agents.length) { try { state.agents = await api('GET', '/api/agents'); } catch { /* keep */ } }
+  renderTeamForm();
+  renderTeamList();
+}
+function updateTeamSelCount() {
+  const n = document.querySelectorAll('.teamAgentCb:checked').length;
+  const el = $('teamSelCount'); if (el) el.textContent = `${n} selected`;
+}
+function renderTeamForm() {
+  const editing = state.editingTeamId ? state.teams.find((t) => t.id === state.editingTeamId) : null;
+  $('teamFormTitle').textContent = editing ? `Edit team: ${editing.name}` : 'Create a team';
+  $('teamName').value = editing ? editing.name : '';
+  $('teamSave').textContent = editing ? 'Update team' : 'Save team';
+  $('teamCancel').style.display = editing ? 'inline-block' : 'none';
+  const chosen = new Set(editing ? editing.agents : []);
+  const online = new Set((state.agents || []).map((a) => a.name));
+  // pick from connected agents + any names the edited team already has (may be offline)
+  const names = [...new Set([...(state.agents || []).map((a) => a.name), ...(editing ? editing.agents : [])])].sort();
+  $('teamAgentPick').innerHTML = names.length
+    ? names.map((n) => `<label class="team-agent-tile">
+        <input type="checkbox" class="teamAgentCb" value="${esc(n)}" ${chosen.has(n) ? 'checked' : ''}>
+        <span class="tat-dot ${online.has(n) ? 'on' : 'off'}"></span>
+        <span class="tat-name">${esc(n)}</span>
+        <span class="tat-state">${online.has(n) ? 'online' : 'offline'}</span>
+      </label>`).join('')
+    : '<span class="empty">No agents known yet — connect agents first, then create a team.</span>';
+  document.querySelectorAll('.teamAgentCb').forEach((cb) => (cb.onchange = updateTeamSelCount));
+  updateTeamSelCount();
+}
+function renderTeamList() {
+  const el = $('teamList');
+  const online = new Set((state.agents || []).map((a) => a.name));
+  $('teamCount').textContent = state.teams.length ? `${state.teams.length} team${state.teams.length === 1 ? '' : 's'}` : '';
+  if (!state.teams.length) { el.innerHTML = '<span class="empty">No teams yet — create one above.</span>'; return; }
+  el.innerHTML = state.teams.map((t) => {
+    const onCount = t.agents.filter((a) => online.has(a)).length;
+    return `
+    <div class="team-card">
+      <div class="team-card-head">
+        <b class="team-card-name">${esc(t.name)}</b>
+        <span class="count-pill">${t.agents.length}</span>
+      </div>
+      <div class="team-card-sub">${onCount}/${t.agents.length} online</div>
+      <div class="team-chips">${t.agents.map((a) => `<span class="team-chip ${online.has(a) ? 'on' : 'off'}"><span class="tat-dot ${online.has(a) ? 'on' : 'off'}"></span>${esc(a)}</span>`).join('') || '<span class="hint" style="margin:0;">no agents</span>'}</div>
+      <div class="team-card-actions">
+        <button type="button" class="primary mini team-use" data-id="${esc(t.id)}">Use in a new run</button>
+        <button type="button" class="ghost mini team-edit" data-id="${esc(t.id)}">Edit</button>
+        <button type="button" class="ghost mini danger team-del" data-id="${esc(t.id)}">Delete</button>
+      </div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.team-use').forEach((b) => (b.onclick = () => { const t = state.teams.find((x) => x.id === b.dataset.id); if (t) useTeamInNewRun(t); }));
+  el.querySelectorAll('.team-edit').forEach((b) => (b.onclick = () => { state.editingTeamId = b.dataset.id; renderTeamForm(); $('teamName').scrollIntoView({ behavior: 'smooth', block: 'center' }); $('teamName').focus(); }));
+  el.querySelectorAll('.team-del').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Delete this team?')) return;
+    try {
+      await api('DELETE', `/api/teams/${b.dataset.id}`);
+      state.teams = state.teams.filter((t) => t.id !== b.dataset.id);
+      if (state.editingTeamId === b.dataset.id) state.editingTeamId = null;
+      renderTeamForm(); renderTeamList(); populateTeamSelect(); renderAgents();
+    } catch (e) { alert(e.message); }
+  }));
+}
+if ($('teamSave')) $('teamSave').onclick = async () => {
+  const name = $('teamName').value.trim();
+  if (!name) { $('teamMsg').textContent = '✗ Enter a team name.'; return; }
+  const agents = [...document.querySelectorAll('.teamAgentCb:checked')].map((c) => c.value);
+  try {
+    if (state.editingTeamId) {
+      const t = await api('PUT', `/api/teams/${state.editingTeamId}`, { name, agents });
+      const i = state.teams.findIndex((x) => x.id === t.id); if (i >= 0) state.teams[i] = t;
+      state.editingTeamId = null;
+    } else {
+      const t = await api('POST', '/api/teams', { name, agents });
+      state.teams.push(t);
+    }
+    $('teamMsg').textContent = '✓ Saved.';
+    setTimeout(() => { $('teamMsg').textContent = ''; }, 2000);
+    renderTeamForm(); renderTeamList(); populateTeamSelect(); renderAgents();
+  } catch (e) { $('teamMsg').textContent = `✗ ${e.message}`; }
+};
+if ($('teamCancel')) $('teamCancel').onclick = () => { state.editingTeamId = null; renderTeamForm(); };
+if ($('teamSelectAll')) $('teamSelectAll').onclick = () => { document.querySelectorAll('.teamAgentCb').forEach((c) => { c.checked = true; }); updateTeamSelCount(); };
+if ($('teamClear')) $('teamClear').onclick = () => { document.querySelectorAll('.teamAgentCb').forEach((c) => { c.checked = false; }); updateTeamSelCount(); };
 
 // ---------------- per-agent profiles ----------------
 
@@ -1356,19 +2104,30 @@ function renderSplitPreview() {
 
 // Validate the New Run form and assemble the run config (shared by Start and
 // Schedule). Throws with a user-facing message if something's missing.
-function buildRunConfig() {
-  // Files this plan actively reads (enabled CSV + enabled thread group) must be
-  // satisfied by the library; per-agent files need a copy for every agent.
-  // In per-agent mode the server validates the union of profiles, so skip here.
-  const requiredRefs = state.distMode === 'per-agent' ? [] : (state.plan.structure.dataFileRefs || []).filter(csvRefNeeded);
-  for (const ref of requiredRefs) {
-    const f = (state.library || []).find((x) => x.logical === ref.name);
-    if (!f) throw new Error(`The plan reads "${ref.name}" but no file is uploaded for it (see step 1).`);
+// Files this plan actively reads (enabled CSV + enabled thread group) must be
+// satisfied by the library; per-agent files need a copy for every selected agent.
+// In per-agent profile mode the server validates the union of profiles, so skip.
+function dataFileIssues() {
+  if (!state.plan || state.distMode === 'per-agent') return [];
+  const issues = [];
+  for (const ref of (state.plan.structure.dataFileRefs || []).filter(csvRefNeeded)) {
+    const f = (state.library || []).find((x) => x.logical === libKey(ref.name));
+    if (!f) { issues.push({ ref: ref.name, msg: `The plan reads "${ref.name}" but no file is attached for it — attach one under Data files (step 3).` }); continue; }
     if (f.mode === 'per-agent') {
       const missing = selectedAgents().filter((a) => !(f.perAgent || {})[a.replace(/[^\w.-]/g, '_')]);
-      if (missing.length) throw new Error(`Upload "${f.logical}" for: ${missing.join(', ')}`);
+      if (missing.length) issues.push({ ref: ref.name, msg: `Attach "${f.logical}" for: ${missing.join(', ')} — click each agent under Data files (step 3).` });
     }
   }
+  return issues;
+}
+
+function buildRunConfig() {
+  // an empty test would start on every agent and send nothing
+  const w = workloadSummary();
+  if (!w.groups.length) throw new Error('No thread group is switched on — turn at least one on in step 2.');
+  if (!w.willRun) throw new Error('No request would run — tick at least one request (under a controller that is on) in step 2.');
+  const issues = dataFileIssues();
+  if (issues.length) throw new Error(issues[0].msg);
   const agents = selectedAgents();
   if (!agents.length) throw new Error('Select at least one load-generator PC (step 3).');
   const config = {
@@ -1397,8 +2156,8 @@ $('startBtn').onclick = async () => {
   try {
     $('startBtn').disabled = true;
     const run = await api('POST', '/api/runs', { planId: state.plan.id, config });
-    onRunUpdate(run);
-    resetLiveView();
+    if (!state.run) resetLiveView();
+    onRunUpdate(run); // resets the live view when this is a new run id
     showView('live');
   } catch (err) {
     $('startErr').textContent = err.message;
@@ -1524,49 +2283,138 @@ $('schRefresh').onclick = () => loadSchedules();
 
 // ---------------- live view ----------------
 
-// Elapsed clock — ticks every second while a run is active (wall time since the
-// first sample), freezes at the sample-span duration once the run ends.
-setInterval(() => {
-  const el = $('tElapsed');
-  if (!el || !state.live) return;
-  if (state.run && state.run.state === 'running') {
-    el.textContent = state.live.startedTs ? fmt.dur((Date.now() - state.live.startedTs) / 1000) : '00:00:00';
-  } else {
-    el.textContent = fmt.dur(state.live.elapsedSec);
+const isActiveRun = (run) => !!run && ['preparing', 'running', 'finalizing'].includes(run.state);
+const isEndedRun = (run) => !!run && ['finished', 'done', 'stopped', 'error'].includes(run.state);
+
+// Planned length in seconds when the plan says so: duration-based groups and
+// bzm rate groups (ramp + hold). Loop-based groups have no fixed length → null.
+function plannedRunSec(run) {
+  const c = run && run.config;
+  if (!c) return null;
+  const tgs = c.mode === 'per-agent'
+    ? Object.values(c.agentConfigs || {}).flatMap((ac) => ac.threadGroups || [])
+    : (c.threadGroups || []);
+  let max = 0;
+  for (const t of tgs) {
+    if (t.enabled === false) continue;
+    if (t.mode === 'duration' && t.duration) max = Math.max(max, Number(t.duration));
+    else if (t.hold != null && t.mode == null) max = Math.max(max, (Number(t.rampUp) || 0) + (Number(t.hold) || 0));
   }
-}, 1000);
+  return max || null;
+}
+
+function liveElapsedSec() {
+  if (!state.live) return null;
+  if (state.run && state.run.state === 'running' && state.live.startedTs) return (Date.now() - state.live.startedTs) / 1000;
+  return state.live.elapsedSec;
+}
+
+// Elapsed clock + progress — ticks every second while a run is active (wall time
+// since the first sample) and freezes at the sample-span duration once it ends.
+function renderLiveProgress() {
+  const run = state.run;
+  if (!run || !$('liveProgress')) return;
+  const sec = liveElapsedSec();
+  $('liveProgress').hidden = sec == null;
+  if (sec == null) return;
+  $('tElapsed').textContent = durHuman(sec);
+  const planned = plannedRunSec(run);
+  const ended = isEndedRun(run);
+  const pct = ended ? 100 : planned ? Math.min(100, (100 * sec) / planned) : null;
+  $('liveBarWrap').classList.toggle('indeterminate', pct == null);
+  $('liveBar').style.width = pct == null ? '' : `${pct}%`;
+  $('liveBarWrap').setAttribute('aria-valuenow', pct == null ? '' : String(Math.round(pct)));
+  $('liveLeft').textContent = ended ? `${RESULT_LABEL[runResult(run)][0]} at ${run.endedAt ? timeOnly(run.endedAt) : '—'}`
+    : run.state === 'finalizing' ? 'Collecting results from the agents…'
+      : planned ? (sec < planned ? `About ${durHuman(planned - sec)} left` : 'Finishing — waiting for the last requests')
+        : 'Runs until every loop is done';
+}
+setInterval(renderLiveProgress, 1000);
 
 function resetLiveView() {
   $('log').textContent = '';
   state.live = null;
+  state.livePeakTps = 0;
   ['tElapsed', 'tTps', 'tAvg', 'tErr', 'tTotal'].forEach((id) => ($(id).textContent = '–'));
+  ['tTpsSub', 'tAvgSub', 'tErrSub', 'tTotalSub'].forEach((id) => ($(id).textContent = ''));
+  $('tErrTile').classList.remove('bad');
   $('labelRows').innerHTML = '';
   const cont = $('lazCharts');
-  if (cont) { cont._sig = null; cont.innerHTML = '<p class="empty">waiting for samples…</p>'; }
+  if (cont) { cont._sig = null; cont.innerHTML = '<p class="empty">Waiting for samples…</p>'; }
 }
 
 function onRunUpdate(run) {
+  const changed = !state.run || state.run.id !== run.id || state.run.state !== run.state;
+  // a different run has started (here, from a schedule or another browser):
+  // clear the previous run's numbers, charts and log first
+  if (state.run && state.run.id !== run.id && isActiveRun(run)) resetLiveView();
   state.run = run;
-  $('liveTitle').textContent = `${run.planName} — ${run.id} · `;
-  const st = document.createElement('span');
-  st.className = `state ${run.state}`;
-  st.textContent = run.state.toUpperCase();
-  $('liveTitle').appendChild(st);
-
+  if (changed && $('view-home').classList.contains('active')) loadHome();
+  const liveBadge = $('navLiveBadge');
+  if (liveBadge) liveBadge.hidden = !isActiveRun(run);
+  renderLiveHead();
   renderLiveAgents();
 
   const tgSel = $('liveTg');
   const kept = tgSel.value;
+  const names = run.tgNames || [];
   tgSel.innerHTML = '<option value="">All thread groups</option>' +
-    (run.tgNames || []).map((n) => `<option value="${esc(n)}" ${n === kept ? 'selected' : ''}>${esc(n)}</option>`).join('');
+    names.map((n) => `<option value="${esc(n)}" ${n === kept ? 'selected' : ''}>${esc(n)}</option>`).join('');
+  renderLiveTgPills();
 
-  $('stopBtn').style.display = run.state === 'running' ? 'inline-block' : 'none';
-  const ended = run.state === 'finished' || run.state === 'stopped' || run.state === 'error';
+  const ended = isEndedRun(run);
   if (ended && state.lastLoggedEnd !== run.id) {
     state.lastLoggedEnd = run.id;
-    appendLog(`run ${run.state}. See History tab for the full summary${run.hasReport ? ' and JMeter dashboard' : ''}.`);
+    appendLog(`run ${run.state}. Open "full results" for the complete report${run.hasReport ? ' and the JMeter dashboard' : ''}.`);
     loadFinalIntoLive(run.id, $('liveTg').value);
   }
+}
+
+function renderLiveHead() {
+  const run = state.run;
+  if (!run) return;
+  const badge = run.state === 'preparing' ? '<span class="rbadge live">Starting</span>'
+    : run.state === 'finalizing' ? '<span class="rbadge live">Finishing</span>' : resultBadge(run);
+  $('liveTitle').innerHTML = `${esc(run.planName || 'Run')} ${badge}`;
+  const agents = run.agents || [];
+  const mode = run.config && run.config.mode === 'per-agent' ? 'per-agent profiles' : 'split evenly';
+  const target = (run.targets || [])[0];
+  $('liveMeta').innerHTML = `Started ${esc(fmt.dt(run.createdAt))} · ${agents.length} agent${agents.length === 1 ? '' : 's'} · ${mode}${target ? ` · target <b>${esc(target)}</b>` : ''}`;
+  const ended = isEndedRun(run);
+  $('stopBtn').hidden = run.state !== 'running';
+  if (run.state !== 'running') $('stopConfirm').hidden = true;
+  $('liveOpenRun').hidden = !ended;
+  $('liveOpenRun').href = `#run/${encodeURIComponent(run.id)}`;
+  $('stopConfirmText').textContent = `All ${agents.length} agent${agents.length === 1 ? '' : 's'} stop within a few seconds. Results collected so far are kept and marked as stopped.`;
+  const vu = runVUsers(run);
+  $('tUsers').textContent = vu != null ? fmt.n(vu) : '–';
+  $('tUsersSub').textContent = vu && agents.length > 1 && !(run.config && run.config.mode === 'per-agent')
+    ? `≈ ${fmt.n(Math.round(vu / agents.length))} on each agent` : 'Configured for this run';
+  renderLiveProgress();
+}
+
+// Thread-group filter as pills (drives the hidden #liveTg select)
+function renderLiveTgPills() {
+  const sel = $('liveTg');
+  const opts = [...sel.options];
+  $('liveTgBar').hidden = opts.length <= 2; // "All" + one group → nothing to filter
+  $('liveTgPills').innerHTML = opts.map((o) => `<button type="button" class="pill${o.value === sel.value ? ' on' : ''}" data-v="${esc(o.value)}" aria-pressed="${o.value === sel.value}">${esc(o.value ? o.textContent : 'All groups')}</button>`).join('');
+  $('liveTgPills').querySelectorAll('.pill').forEach((b) => (b.onclick = () => {
+    sel.value = b.dataset.v;
+    sel.dispatchEvent(new Event('change'));
+    renderLiveTgPills();
+  }));
+}
+
+function setLiveTiles(src, kind) {
+  // kind: 'window' (last 10 s while running) | 'run' (whole stored run)
+  const errPct = kind === 'run' ? src.errorPct : src.errPct;
+  $('tTps').textContent = `${kind === 'run' ? src.throughput : src.tps} req/s`;
+  $('tAvg').textContent = msHuman(src.avg);
+  $('tErr').textContent = `${errPct}%`;
+  $('tErrTile').classList.toggle('bad', errPct > 0);
+  $('tTpsSub').textContent = kind === 'run' ? 'Whole run' : `Last 10 s${state.livePeakTps ? ` · peak ${state.livePeakTps} req/s` : ''}`;
+  $('tAvgSub').textContent = kind === 'run' ? 'Whole run' : 'Last 10 s';
 }
 
 /**
@@ -1584,16 +2432,14 @@ async function loadFinalIntoLive(id, tg = '') {
       s = r.summary;
     }
     if (!s || !s.overall || !s.overall.samples) return;
-    $('tElapsed').textContent = fmt.dur(s.durationSec);
-    $('tTps').textContent = fmt.n(s.overall.throughput);
-    $('tAvg').textContent = fmt.ms(s.overall.avg);
-    $('tErr').textContent = fmt.pct(s.overall.errorPct);
+    if (!tg && state.run && state.run.id === id) { state.run.overall = s.overall; renderLiveHead(); } // SLA verdict in the badge
+    if (!state.live) state.live = { elapsedSec: s.durationSec };
+    $('tElapsed').textContent = durHuman(s.durationSec);
+    setLiveTiles(s.overall, 'run');
+    $('tErrSub').textContent = `${fmt.n(s.overall.errors)} failed`;
     $('tTotal').textContent = fmt.n(s.overall.samples);
-    $('labelRows').innerHTML = s.perLabel
-      .slice().sort((a, b) => b.samples - a.samples)
-      .map((row) => `<tr><td>${esc(row.label)}</td><td class="num">${fmt.n(row.samples)}</td>
-        <td class="num" style="${row.errors ? 'color:var(--critical)' : ''}">${fmt.n(row.errors)}</td>
-        <td class="num">${fmt.n(row.avg)}</td><td class="num">${fmt.n(row.max)}</td></tr>`).join('');
+    $('tTotalSub').textContent = 'Whole run';
+    renderLabelRows(s.perLabel);
     const td = await api('GET', `/api/runs/${id}/timeline-detail${q}`);
     const cont = $('lazCharts');
     if (cont && td.t && td.t.length) {
@@ -1603,12 +2449,33 @@ async function loadFinalIntoLive(id, tg = '') {
       cont.innerHTML = azChartsHtml('laz', td, s, vu, rk);
       azChartsDraw('laz', td, vu, rk);
     }
+    renderLiveProgress();
   } catch { /* no stored results (e.g. failed before samples) */ }
 }
 
-$('stopBtn').onclick = () => api('POST', `/api/runs/${state.run.id}/stop`).catch((e) => appendLog(`stop failed: ${e.message}`));
+function renderLabelRows(perLabel) {
+  $('labelRows').innerHTML = perLabel.slice().sort((a, b) => b.samples - a.samples)
+    .map((r) => `<tr><td>${esc(r.label)}</td><td class="num">${fmt.n(r.samples)}</td>
+      <td class="num${r.errors ? ' err-txt' : ''}">${fmt.n(r.errors)}</td>
+      <td class="num">${fmt.tp(r.throughput)}</td>
+      <td class="num">${fmt.n(r.avg)}</td><td class="num">${fmt.n(r.max)}</td></tr>`).join('');
+}
 
-/** Agent chips with each agent's own test time + a slow-network flag for outliers. */
+$('stopBtn').onclick = () => { $('stopConfirm').hidden = false; $('stopCancel').focus(); };
+$('stopCancel').onclick = () => { $('stopConfirm').hidden = true; $('stopBtn').focus(); };
+$('stopYes').onclick = async () => {
+  $('stopYes').disabled = true;
+  try { await api('POST', `/api/runs/${state.run.id}/stop`); appendLog('stop requested — agents are stopping…'); } catch (e) { appendLog(`stop failed: ${e.message}`); }
+  $('stopYes').disabled = false;
+  $('stopConfirm').hidden = true;
+};
+$('liveOpenRun').onclick = (e) => {
+  if (e.ctrlKey || e.metaKey || e.shiftKey || !state.run) return;
+  e.preventDefault();
+  openRun(state.run.id);
+};
+
+/** One row per agent: its own test time, avg latency, live CPU/RAM, and flags. */
 function renderLiveAgents() {
   const run = state.run;
   if (!run) return;
@@ -1620,20 +2487,36 @@ function renderLiveAgents() {
   const fastest = vals.length ? Math.min(...vals) : 0;
   const isSlow = (name) => avgMs[name] > 0 && fastest > 0 && avgMs[name] >= 5 * fastest && avgMs[name] - fastest > 1000;
   const resByName = new Map((state.agents || []).map((x) => [x.name, x.res]));
-  $('liveAgents').innerHTML = run.agents.map((a) => {
+  const STATE_TXT = { running: ['Running', 'live'], done: ['Done', 'ok'], finished: ['Done', 'ok'], error: ['Error', 'bad'], stopped: ['Stopped', 'neutral'] };
+  let maxed = 0;
+  $('liveAgents').innerHTML = (run.agents || []).map((a) => {
     const sec = liveElapsed[a.name] != null ? liveElapsed[a.name] : a.durationSec;
     const slow = isSlow(a.name);
-    const lat = avgMs[a.name] != null ? ` · ${fmt.n(avgMs[a.name])}ms avg` : '';
     const res = resByName.get(a.name);
-    const saturated = res && (res.cpu >= 90 || res.mem >= 90);
-    return `<span class="chip ${a.state === 'running' ? 'running' : a.state === 'done' ? 'done' : a.state === 'error' ? 'error' : ''}${slow ? ' slow' : ''}"
-       ${slow ? `title="Average response ${fmt.n(avgMs[a.name])}ms vs ${fmt.n(fastest)}ms on the fastest agent — likely a slow network path from this PC to the target, not real load."` : ''}>
-       <b>${esc(a.name)}</b> ${a.state}${sec != null ? ` · ${ic('clock')} ${fmt.dur(sec)}` : ''}${lat}${a.state === 'running' ? ` ${resMeter(res, a.name)}` : ''}${saturated ? ` <b class="slow-badge">${ic('warn')} generator maxed</b>` : ''}${slow ? ` <b class="slow-badge">${ic('warn')} slow network path</b>` : ''}${a.error ? ` — ${esc(a.error)}` : ''}</span>`;
+    const saturated = a.state === 'running' && res && (res.cpu >= 90 || res.mem >= 90);
+    if (saturated) maxed++;
+    const [st, cls] = STATE_TXT[a.state] || [a.state || '—', 'neutral'];
+    const notes = [
+      saturated ? `<span class="slow-badge">${ic('warn')} PC near its CPU/RAM limit — results may be skewed</span>` : '',
+      slow ? `<span class="slow-badge" title="Average response ${fmt.n(avgMs[a.name])} ms vs ${fmt.n(fastest)} ms on the fastest agent">${ic('warn')} Slow network path to the target</span>` : '',
+      a.error ? `<span class="err-txt">${esc(a.error)}</span>` : '',
+      a.note && !a.error ? `<span class="hint" style="margin:0">${esc(a.note)}</span>` : '',
+    ].filter(Boolean).join(' ');
+    return `<tr${slow || saturated ? ' class="agent-slow"' : ''}>
+      <td><b>${esc(a.name)}</b></td>
+      <td><span class="rbadge ${cls}">${esc(st)}</span></td>
+      <td class="num">${sec != null ? durHuman(sec) : '–'}</td>
+      <td class="num">${avgMs[a.name] != null ? msHuman(avgMs[a.name]) : '–'}</td>
+      <td>${a.state === 'running' ? resMeter(res, a.name) : '<span class="hint" style="margin:0">—</span>'}</td>
+      <td>${notes || '<span class="hint" style="margin:0">—</span>'}</td>
+    </tr>`;
   }).join('');
+  $('liveAgentWarn').hidden = !maxed;
+  $('liveAgentWarn').textContent = maxed ? `${maxed} agent${maxed === 1 ? '' : 's'} near the CPU or RAM limit` : '';
 }
 
 $('liveTg').onchange = () => {
-  const ended = state.run && ['finished', 'stopped', 'error'].includes(state.run.state);
+  const ended = state.run && isEndedRun(state.run);
   // After a run ends, filter from the stored results (live snapshots are gone
   // after a page reload); during a run, use the streaming per-group stats.
   if (ended) loadFinalIntoLive(state.run.id, $('liveTg').value);
@@ -1641,14 +2524,15 @@ $('liveTg').onchange = () => {
 };
 
 function renderLive() {
-  if (!state.live) return;
+  if (!state.live || !state.live.window) return;
   // A selected thread group swaps in that group's snapshot (same shape).
   const sel = $('liveTg').value;
   const l = sel && state.live.byTg && state.live.byTg[sel] ? state.live.byTg[sel] : state.live;
-  $('tTps').textContent = fmt.n(l.window.tps);
-  $('tAvg').textContent = fmt.ms(l.window.avg);
-  $('tErr').textContent = fmt.pct(l.window.errPct);
+  if (!sel) state.livePeakTps = Math.max(state.livePeakTps || 0, l.window.tps || 0);
+  setLiveTiles(l.window, 'window');
+  $('tErrSub').textContent = `Last 10 s · ${fmt.n(l.totalErrors || 0)} failed in total`;
   $('tTotal').textContent = fmt.n(l.totalSamples);
+  $('tTotalSub').textContent = state.live.startedTs ? `Since ${new Date(state.live.startedTs).toLocaleTimeString('en-GB')}` : '';
 
   // per-sampler live charts — rebuild the structure only when the sampler set
   // changes, otherwise just repaint the canvases (cheap, every tick).
@@ -1662,13 +2546,10 @@ function renderLive() {
     if (cont._sig !== sig) { cont._sig = sig; cont.innerHTML = azChartsHtml('laz', td, null, vu, rk); }
     azChartsDraw('laz', td, vu, rk);
   }
-
-  $('labelRows').innerHTML = l.perLabel
-    .sort((a, b) => b.samples - a.samples)
-    .map((r) => `<tr><td>${esc(r.label)}</td><td class="num">${fmt.n(r.samples)}</td>
-      <td class="num" style="${r.errors ? 'color:var(--critical)' : ''}">${fmt.n(r.errors)}</td>
-      <td class="num">${fmt.n(r.avg)}</td><td class="num">${fmt.n(r.max)}</td></tr>`).join('');
+  renderLabelRows(l.perLabel);
+  renderLiveProgress();
 }
+
 
 function appendLog(line) {
   const el = $('log');
@@ -1903,115 +2784,40 @@ function niceMax(v) {
   return 10 * mag;
 }
 
-// ---------------- history ----------------
+// ---------------- runs: one list of every run (replaces Dashboard + History) ----------------
 
-async function loadHistory() {
-  await ensureSla();
-  const runs = await api('GET', '/api/runs');
-  $('runEmpty').style.display = runs.length ? 'none' : 'block';
-  const counts = {};
-  for (const r of runs) counts[dayKey(r.createdAt)] = (counts[dayKey(r.createdAt)] || 0) + 1;
+const runsState = { runs: [], q: '', plan: '', target: '', result: '', period: '', page: 0, sel: new Set(), bound: false };
+const RUNS_PAGE = 50;
 
-  const row = (r) => {
-    const o = r.overall;
-    const target = (r.targets && r.targets[0]) ? `<span class="run-target" title="${esc(runTargetTitle(r))}">${esc(r.targets[0])}</span>` : '';
-    return `<tr style="cursor:pointer" data-id="${esc(r.id)}" onclick="showRunDetail('${r.id}')">
-      <td>${timeOnly(r.createdAt)}</td>
-      <td>${esc(r.planName || '')}${target}</td>
-      <td><span class="state ${r.state}">${r.state}</span>${slaPill(r)}</td>
-      <td class="num">${fmt.dur(r.durationSec)}</td>
-      <td class="num">${r.agents ? r.agents.length : '–'}</td>
-      <td class="num">${o ? fmt.n(o.samples) : '–'}</td>
-      <td class="num">${o ? fmt.n(o.avg) : '–'}</td>
-      <td class="num">${o ? o.errorPct : '–'}</td>
-      <td class="num">${o ? fmt.tp(o.throughput) : '–'}</td>
-      <td class="num"><button class="ghost mini row-del" title="Delete this run" onclick="deleteRun('${r.id}', event)">✕</button></td>
-    </tr>`;
-  };
-
-  let html = '', lastDay = null;
-  for (const r of runs) {
-    const dk = dayKey(r.createdAt);
-    if (dk !== lastDay) {
-      lastDay = dk;
-      html += `<tr class="date-row"><td colspan="10">${ic('calendar')} <b>${esc(dayLabel(r.createdAt))}</b> <span class="date-count">${counts[dk]} run${counts[dk] > 1 ? 's' : ''}</span></td></tr>`;
-    }
-    html += row(r);
-  }
-  $('runRows').innerHTML = html;
+// "26 s", "2 m 53 s", "1 h 4 m" — easier to scan than 00:02:53 in lists and headers
+function durHuman(sec) {
+  if (sec == null) return '–';
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} m${s % 60 ? ` ${s % 60} s` : ''}`;
+  const m = Math.floor((s % 3600) / 60);
+  return `${Math.floor(s / 3600)} h${m ? ` ${m} m` : ''}`;
+}
+// big response times read better in seconds: 125,159 ms → 125.2 s
+function msHuman(v) {
+  if (v == null) return '–';
+  return v >= 10000 ? `${(v / 1000).toFixed(1)} s` : fmt.ms(v);
 }
 
-// ---------------- dashboard ----------------
-// An at-a-glance overview across ALL runs (KPI cards + a per-run throughput
-// trend) with filters, plus a drill-down: click any run to see Azure-style
-// metric cards, over-time charts and the aggregate report for that run.
-
-const dashState = { runs: [], selectedId: null, plan: '', target: '', state: '', q: '', bound: false, detailTg: '' };
-
-async function loadDashboard() {
-  if (!dashState.bound) {
-    dashState.bound = true;
-    $('dashSearch').oninput = () => { dashState.q = $('dashSearch').value.trim(); renderDashboard(); };
-    $('dashPlan').onchange  = () => { dashState.plan = $('dashPlan').value; renderDashboard(); };
-    $('dashTarget').onchange = () => { dashState.target = $('dashTarget').value; renderDashboard(); };
-    $('dashState').onchange = () => { dashState.state = $('dashState').value; renderDashboard(); };
-    $('dashRefresh').onclick = () => loadDashboard();
-    $('slaSave').onclick = saveSla;
-    $('cmpA').onchange = () => { cmpState.a = $('cmpA').value; renderCompare(); };
-    $('cmpB').onchange = () => { cmpState.b = $('cmpB').value; renderCompare(); };
-    $('cmpClear').onclick = () => { cmpState.a = ''; cmpState.b = ''; $('cmpA').value = ''; $('cmpB').value = ''; renderCompare(); };
-  }
-  try { dashState.runs = await api('GET', '/api/runs'); } catch { dashState.runs = []; }
-  try { slaThresholds = await api('GET', '/api/sla'); } catch { /* keep */ }
-  fillSlaInputs();
-  fillCompareOptions();
-  const plans = [...new Set(dashState.runs.map((r) => r.planName).filter(Boolean))].sort();
-  $('dashPlan').innerHTML = `<option value="">All plans</option>` +
-    plans.map((p) => `<option value="${esc(p)}" ${p === dashState.plan ? 'selected' : ''}>${esc(p)}</option>`).join('');
-  // web-address filter — the PRIMARY app each run tested (not incidental deps)
-  const targets = [...new Set(dashState.runs.map((r) => (r.targets || [])[0]).filter(Boolean))].sort();
-  $('dashTarget').innerHTML = `<option value="">All web addresses</option>` +
-    targets.map((t) => `<option value="${esc(t)}" ${t === dashState.target ? 'selected' : ''}>${esc(t)}</option>`).join('');
-  renderDashboard();
+// One verdict per run, used by the list, the filters and the run page.
+function runResult(r) {
+  if (['running', 'finalizing', 'preparing'].includes(r.state)) return 'running';
+  if (r.state === 'error') return 'error';
+  if (r.state === 'stopped') return 'stopped';
+  return slaVerdict(r) || 'done';
 }
-
-function dashFiltered() {
-  const q = dashState.q.toLowerCase();
-  return dashState.runs.filter((r) =>
-    (!dashState.plan || r.planName === dashState.plan) &&
-    (!dashState.target || (r.targets || [])[0] === dashState.target) &&
-    (!dashState.state || r.state === dashState.state) &&
-    (!q || (r.planName || '').toLowerCase().includes(q) || (r.id || '').toLowerCase().includes(q)
-      || (r.targets || []).some((t) => t.includes(q))));
-}
-
-function fillSlaInputs() {
-  if (!slaThresholds) return;
-  $('slaErr').value = slaThresholds.maxErrorPct ?? '';
-  $('slaP90').value = slaThresholds.maxP90Ms ?? '';
-  $('slaTp').value = slaThresholds.minThroughput ?? '';
-}
-async function saveSla() {
-  const val = (id) => ($(id).value === '' ? null : +$(id).value);
-  try {
-    const d = await api('PUT', '/api/sla', { maxErrorPct: val('slaErr'), maxP90Ms: val('slaP90'), minThroughput: val('slaTp') });
-    slaThresholds = d.sla;
-    $('slaMsg').textContent = 'saved ✓';
-    setTimeout(() => { $('slaMsg').textContent = ''; }, 1500);
-    renderDashboard();
-  } catch (e) { $('slaMsg').textContent = e.message; }
-}
-
-function renderDashboard() {
-  const runs = dashFiltered();
-  const fails = slaActive() ? runs.filter((r) => slaVerdict(r) === 'fail').length : null;
-  $('dashSub').textContent = `${runs.length} run${runs.length === 1 ? '' : 's'}${dashState.plan ? ` · ${dashState.plan}` : ''}${fails != null ? ` · ${fails} failing SLA` : ''}`;
-  renderDashKpis(runs);
-  renderDashTrend(runs);
-  renderDashTable(runs);
-  if (dashState.selectedId && !runs.some((r) => r.id === dashState.selectedId)) {
-    dashState.selectedId = null; $('dashDetail').innerHTML = '';
-  }
+const RESULT_LABEL = {
+  pass: ['Passed', 'ok'], fail: ['Failed SLA', 'bad'], done: ['Finished', 'neutral'],
+  stopped: ['Stopped', 'neutral'], error: ['Error', 'bad'], running: ['Running', 'live'],
+};
+function resultBadge(r) {
+  const [text, cls] = RESULT_LABEL[runResult(r)];
+  return `<span class="rbadge ${cls}">${text}</span>`;
 }
 
 function kpiCard(c) {
@@ -2022,42 +2828,160 @@ function kpiCard(c) {
   </div>`;
 }
 
-function renderDashKpis(runs) {
-  const wd = runs.filter((r) => r.overall);
-  const totReq = wd.reduce((a, r) => a + (r.overall.samples || 0), 0);
-  const totErr = wd.reduce((a, r) => a + (r.overall.errors || 0), 0);
-  const peak = wd.reduce((a, r) => Math.max(a, r.overall.throughput || 0), 0);
-  const avgResp = wd.length ? Math.round(wd.reduce((a, r) => a + (r.overall.avg || 0), 0) / wd.length) : null;
-  const errRate = totReq ? +(100 * totErr / totReq).toFixed(2) : 0;
-  const failed = runs.filter((r) => r.state === 'error').length;
-  const cards = [
-    { k: 'Total runs', v: fmt.n(runs.length) },
-    { k: 'Total requests', v: fmt.n(totReq) },
-    { k: 'Peak throughput', v: peak ? fmt.tp(peak) : '–' },
-    { k: 'Avg response', v: avgResp != null ? fmt.ms(avgResp) : '–' },
-    { k: 'Overall error rate', v: `${errRate}%`, tone: errRate > 5 ? 'bad' : errRate > 0 ? 'warn' : 'good' },
-    { k: 'Failed runs', v: fmt.n(failed), tone: failed ? 'bad' : 'good' },
-  ];
-  $('dashKpis').innerHTML = cards.map(kpiCard).join('');
+function fillSelect(id, allLabel, values, cur) {
+  $(id).innerHTML = `<option value="">${allLabel}</option>` +
+    values.map((v) => `<option value="${esc(v)}" ${v === cur ? 'selected' : ''}>${esc(v)}</option>`).join('');
 }
 
-function renderDashTrend(runs) {
-  const el = $('dashTrend');
-  const wd = runs.filter((r) => r.overall);
-  const recent = wd.slice(0, 40).reverse(); // list is newest-first; oldest on the left, newest on the right
-  $('dashTrendHint').textContent = wd.length > 40 ? `latest 40 of ${wd.length}` : '';
-  if (!recent.length) { el.innerHTML = '<div class="dash-trend-empty">No completed runs to chart yet</div>'; return; }
-  const max = Math.max(1, ...recent.map((r) => r.overall.throughput || 0));
-  el.innerHTML = recent.map((r) => {
-    const tp = r.overall.throughput || 0;
-    const h = Math.max(4, Math.round((tp / max) * 100));
-    const tone = r.overall.errorPct > 5 ? 'bad' : r.overall.errorPct > 0 ? 'warn' : 'good';
-    const sel = r.id === dashState.selectedId ? ' sel' : '';
-    return `<button class="tbar ${tone}${sel}" style="height:${h}%" data-id="${esc(r.id)}"
-      title="${esc(r.planName || '')}&#10;${fmt.dt(r.createdAt)}&#10;${fmt.tp(tp)} · ${r.overall.errorPct}% err · ${fmt.n(r.overall.samples)} req"></button>`;
-  }).join('');
-  el.querySelectorAll('.tbar').forEach((b) => b.onclick = () => selectDashRun(b.dataset.id));
+async function loadRuns() {
+  if (!runsState.bound) {
+    runsState.bound = true;
+    const bind = (id, key, ev) => $(id).addEventListener(ev || 'change', () => {
+      runsState[key] = $(id).value.trim(); runsState.page = 0; renderRuns();
+    });
+    bind('runsQ', 'q', 'input'); bind('runsPlan', 'plan'); bind('runsTarget', 'target');
+    bind('runsResult', 'result'); bind('runsPeriod', 'period');
+    $('runsPrev').onclick = () => { runsState.page--; renderRuns(); };
+    $('runsNext').onclick = () => { runsState.page++; renderRuns(); };
+    $('runsSelAll').onchange = () => {
+      const on = $('runsSelAll').checked;
+      pageRuns().forEach((r) => (on ? runsState.sel.add(r.id) : runsState.sel.delete(r.id)));
+      renderRuns();
+    };
+    $('runsCompare').onclick = compareSelected;
+    $('runsDelete').onclick = deleteSelectedRuns;
+    $('cmpClose').onclick = () => { $('runsCompareCard').hidden = true; };
+  }
+  await ensureSla();
+  try { runsState.runs = await api('GET', '/api/runs'); } catch { runsState.runs = []; }
+  const ids = new Set(runsState.runs.map((r) => r.id));
+  [...runsState.sel].forEach((id) => { if (!ids.has(id)) runsState.sel.delete(id); });
+  fillSelect('runsPlan', 'All plans', [...new Set(runsState.runs.map((r) => r.planName).filter(Boolean))].sort(), runsState.plan);
+  // web address = the PRIMARY app each run tested (not incidental dependencies)
+  fillSelect('runsTarget', 'All web addresses', [...new Set(runsState.runs.map((r) => (r.targets || [])[0]).filter(Boolean))].sort(), runsState.target);
+  renderRuns();
 }
+
+function runsFiltered() {
+  const s = runsState;
+  const q = s.q.toLowerCase();
+  const since = !s.period ? null
+    : s.period === '1' ? new Date(new Date().setHours(0, 0, 0, 0))
+      : new Date(Date.now() - Number(s.period) * 864e5);
+  return s.runs.filter((r) =>
+    (!s.plan || r.planName === s.plan) &&
+    (!s.target || (r.targets || [])[0] === s.target) &&
+    (!s.result || runResult(r) === s.result) &&
+    (!since || new Date(r.createdAt) >= since) &&
+    (!q || `${r.planName || ''} ${r.id} ${(r.targets || []).join(' ')}`.toLowerCase().includes(q)));
+}
+function pageRuns() {
+  return runsFiltered().slice(runsState.page * RUNS_PAGE, (runsState.page + 1) * RUNS_PAGE);
+}
+
+function renderRuns() {
+  const all = runsFiltered();
+  const pages = Math.max(1, Math.ceil(all.length / RUNS_PAGE));
+  runsState.page = Math.min(Math.max(0, runsState.page), pages - 1);
+  const start = runsState.page * RUNS_PAGE;
+  const rows = all.slice(start, start + RUNS_PAGE);
+  const perDay = {};
+  for (const r of all) perDay[dayKey(r.createdAt)] = (perDay[dayKey(r.createdAt)] || 0) + 1;
+
+  const rowHtml = (r) => {
+    const o = r.overall;
+    const users = runVUsers(r);
+    const on = runsState.sel.has(r.id);
+    const target = (r.targets || [])[0];
+    return `<tr data-id="${esc(r.id)}"${on ? ' class="sel"' : ''}>
+      <td class="sel-col"><input type="checkbox" class="runSel" data-id="${esc(r.id)}" ${on ? 'checked' : ''} aria-label="Select the run started ${esc(fmt.dt(r.createdAt))}"></td>
+      <td class="run-time">${timeOnly(r.createdAt)}</td>
+      <td><a class="run-link" href="#run/${encodeURIComponent(r.id)}">${esc(r.planName || r.id)}</a>${target ? `<span class="run-target" title="${esc(runTargetTitle(r))}">${esc(target)}</span>` : ''}</td>
+      <td>${resultBadge(r)}</td>
+      <td class="num">${durHuman(r.durationSec)}</td>
+      <td class="num">${users != null ? fmt.n(users) : '–'}</td>
+      <td class="num">${o ? fmt.n(o.samples) : '–'}</td>
+      <td class="num${o && o.errorPct > 0 ? ' err-txt' : ''}">${o ? `${o.errorPct}%` : '–'}</td>
+      <td class="num">${o ? fmt.tp(o.throughput) : '–'}</td>
+    </tr>`;
+  };
+  let html = '', lastDay = null;
+  for (const r of rows) {
+    const dk = dayKey(r.createdAt);
+    if (dk !== lastDay) {
+      lastDay = dk;
+      html += `<tr class="date-row"><td colspan="9">${esc(dayLabel(r.createdAt))} <span class="date-count">· ${perDay[dk]} run${perDay[dk] > 1 ? 's' : ''}</span></td></tr>`;
+    }
+    html += rowHtml(r);
+  }
+  $('runsRows').innerHTML = html;
+  $('runsEmpty').hidden = all.length > 0;
+
+  const fails = all.filter((r) => runResult(r) === 'fail').length;
+  $('runsSummary').textContent = all.length
+    ? `${fmt.n(all.length)} run${all.length === 1 ? '' : 's'}${fails ? ` · ${fails} failed SLA` : ''} · tick two runs to compare them side by side`
+    : '';
+  $('runsPageInfo').textContent = all.length
+    ? `Showing ${fmt.n(start + 1)}–${fmt.n(start + rows.length)} of ${fmt.n(all.length)}, newest first` : '';
+  $('runsPrev').disabled = runsState.page === 0;
+  $('runsNext').disabled = runsState.page >= pages - 1;
+  $('runsSelAll').checked = rows.length > 0 && rows.every((r) => runsState.sel.has(r.id));
+  updateRunsBar();
+
+  $('runsRows').querySelectorAll('tr[data-id]').forEach((tr) => {
+    tr.onclick = (e) => {
+      if (e.target.closest('.sel-col') || e.target.closest('a')) return; // checkbox / real link handle themselves
+      openRun(tr.dataset.id);
+    };
+  });
+  $('runsRows').querySelectorAll('.runSel').forEach((cb) => {
+    cb.onchange = () => {
+      if (cb.checked) runsState.sel.add(cb.dataset.id); else runsState.sel.delete(cb.dataset.id);
+      cb.closest('tr').classList.toggle('sel', cb.checked);
+      updateRunsBar();
+    };
+  });
+  $('runsRows').querySelectorAll('.run-link').forEach((a) => {
+    a.onclick = (e) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return; // let the browser open a new tab
+      e.preventDefault();
+      openRun(a.closest('tr').dataset.id);
+    };
+  });
+}
+
+function updateRunsBar() {
+  const n = runsState.sel.size;
+  $('runsCompare').textContent = `Compare selected (${n})`;
+  $('runsCompare').disabled = n !== 2;
+  $('runsCompare').title = n === 2 ? '' : 'Tick exactly two runs to compare them';
+  $('runsDelete').hidden = n === 0;
+  $('runsDelete').textContent = `Delete selected (${n})`;
+}
+
+function compareSelected() {
+  const picked = [...runsState.sel].map((id) => runsState.runs.find((r) => r.id === id)).filter(Boolean);
+  if (picked.length !== 2) return;
+  picked.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)); // A = older, B = newer
+  cmpState.a = picked[0].id;
+  cmpState.b = picked[1].id;
+  $('runsCompareCard').hidden = false;
+  renderCompare();
+  $('runsCompareCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function deleteSelectedRuns() {
+  const ids = [...runsState.sel];
+  if (!ids.length) return;
+  if (!confirm(`Delete ${ids.length} run${ids.length === 1 ? '' : 's'}?\nTheir results, reports and logs are removed permanently.`)) return;
+  let failed = 0;
+  for (const id of ids) {
+    try { await api('DELETE', `/api/runs/${encodeURIComponent(id)}`); runsState.sel.delete(id); } catch { failed++; }
+  }
+  if (failed) alert(`${failed} run${failed === 1 ? '' : 's'} could not be deleted — a run that is still active can't be removed.`);
+  loadRuns();
+}
+
 
 // day bucket key + human title, e.g. "Wednesday, 22 Jul 2026"
 function dayKey(iso) { const d = new Date(iso); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; }
@@ -2070,51 +2994,9 @@ function runTargetTitle(r) {
   return t.length > 1 ? `Primary: ${t[0]}\nAlso called: ${t.slice(1).join(', ')}` : `Target: ${t[0]}`;
 }
 
-// Runs are grouped under a date header (the date is the "title"; each day's
-// runs sit under it). Runs arrive newest-first, so groups do too.
-function renderDashTable(runs) {
-  $('dashEmpty').style.display = runs.length ? 'none' : 'block';
-  const counts = {};
-  for (const r of runs) counts[dayKey(r.createdAt)] = (counts[dayKey(r.createdAt)] || 0) + 1;
-
-  const row = (r) => {
-    const o = r.overall;
-    const sel = r.id === dashState.selectedId ? ' class="sel"' : '';
-    const target = (r.targets && r.targets[0]) ? `<span class="run-target" title="${esc(runTargetTitle(r))}">${esc(r.targets[0])}</span>` : '';
-    return `<tr${sel} data-id="${esc(r.id)}">
-      <td>${timeOnly(r.createdAt)}</td>
-      <td>${esc(r.planName || '')}${target}</td>
-      <td><span class="state ${r.state}">${r.state}</span>${slaPill(r)}</td>
-      <td class="num">${fmt.dur(r.durationSec)}</td>
-      <td class="num">${r.agents ? r.agents.length : '–'}</td>
-      <td class="num">${o ? fmt.n(o.samples) : '–'}</td>
-      <td class="num">${o ? fmt.n(o.avg) : '–'}</td>
-      <td class="num" style="${o ? errStyle(o.errorPct) : ''}">${o ? o.errorPct : '–'}</td>
-      <td class="num">${o ? fmt.tp(o.throughput) : '–'}</td></tr>`;
-  };
-
-  let html = '', lastDay = null;
-  for (const r of runs) {
-    const dk = dayKey(r.createdAt);
-    if (dk !== lastDay) {
-      lastDay = dk;
-      html += `<tr class="date-row"><td colspan="9">${ic('calendar')} <b>${esc(dayLabel(r.createdAt))}</b> <span class="date-count">${counts[dk]} run${counts[dk] > 1 ? 's' : ''}</span></td></tr>`;
-    }
-    html += row(r);
-  }
-  $('dashRunRows').innerHTML = html;
-  $('dashRunRows').querySelectorAll('tr[data-id]').forEach((tr) => tr.onclick = () => selectDashRun(tr.dataset.id));
-}
-
 // ---------------- run comparison (A vs B) ----------------
 const cmpState = { a: '', b: '', cache: {} };
 
-function fillCompareOptions() {
-  const opts = `<option value="">— select run —</option>` + dashState.runs.filter((r) => r.overall).map((r) =>
-    `<option value="${esc(r.id)}">${esc(fmt.ymd(r.createdAt))} · ${esc(r.planName || '')} · ${esc((r.targets || [])[0] || '')}</option>`).join('');
-  $('cmpA').innerHTML = opts; $('cmpB').innerHTML = opts;
-  $('cmpA').value = cmpState.a; $('cmpB').value = cmpState.b;
-}
 
 async function cmpRun(id) {
   if (!cmpState.cache[id]) cmpState.cache[id] = await api('GET', `/api/runs/${id}`);
@@ -2301,114 +3183,6 @@ function azChartsDraw(prefix, td, vu, rateKind) {
   drawArea($(prefix + 'Err'), { t: td.t, stacked: true, series: td.labels.map((l, i) => ({ name: l, color: labelColor(i), values: td.series[l].errors })), tip: $(prefix + 'ErrTip') });
 }
 
-async function selectDashRun(id) {
-  dashState.selectedId = id;
-  renderDashTrend(dashFiltered());
-  renderDashTable(dashFiltered());
-  const box = $('dashDetail');
-  box.innerHTML = '<div class="card"><p class="empty">loading run…</p></div>';
-  let r;
-  try { r = await api('GET', `/api/runs/${id}`); }
-  catch (e) { box.innerHTML = `<div class="card"><p class="empty">Could not load run: ${esc(e.message)}</p></div>`; return; }
-  dashState.detailTg = ''; // reset filter for the newly selected run
-  const s0 = r.summary;
-  const links = [
-    r.hasReport ? `<a href="/runs-static/${id}/report/index.html" target="_blank">JMeter dashboard</a>` : '',
-    r.hasMerged ? `<a href="/api/runs/${id}/merged.jtl">merged .jtl</a>` : '',
-    `<a href="/api/runs/${id}/log" target="_blank">run log</a>`,
-  ].filter(Boolean).join(' · ');
-  // Thread-group filter — only when the run actually has more than one group.
-  const tgFilter = (r.tgNames || []).length > 1
-    ? `<label class="field dash-tg-filter">Thread group
-        <select id="dashTgSel"><option value="">All thread groups</option>${r.tgNames.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</select>
-      </label>`
-    : '';
-
-  box.innerHTML = `
-    <div class="card dash-detail">
-      <div class="dash-detail-head">
-        <div>
-          <h2>${esc(r.planName || 'Run')} <span class="state ${r.state}">${r.state}</span></h2>
-          <p class="dash-sub">${fmt.dt(r.createdAt)} · ${ic('clock')} ${fmt.dur(s0 ? s0.durationSec : r.durationSec)} · agents: ${esc((r.agents || []).map((a) => a.name).join(', ') || '–')}</p>
-        </div>
-        <div class="dash-detail-links">${links}${s0 && s0.overall && s0.overall.samples ? ` · <button class="ghost mini dash-send-sheet" data-id="${esc(id)}">${ic('download')} Send to Sheet</button>` : ''}</div>
-      </div>
-      ${tgFilter}
-      <div id="dashBody"><p class="empty">loading…</p></div>
-    </div>`;
-
-  const sendBtn = box.querySelector('.dash-send-sheet');
-  if (sendBtn) sendBtn.onclick = () => sendRunToSheet(sendBtn.dataset.id, sendBtn);
-  const tgSel = document.getElementById('dashTgSel');
-  if (tgSel) tgSel.onchange = () => { dashState.detailTg = tgSel.value; loadDashBody(r); };
-  await loadDashBody(r);
-  box.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-// Render the metric cards + charts + aggregate for the selected run, honoring the
-// Thread-group filter (dashState.detailTg). Re-runs when that dropdown changes.
-async function loadDashBody(r) {
-  const body = document.getElementById('dashBody');
-  if (!body) return;
-  const tg = dashState.detailTg || '';
-  const qs = tg ? `?tg=${encodeURIComponent(tg)}` : '';
-  body.innerHTML = '<p class="empty">loading…</p>';
-  let td = { t: [], labels: [], series: {}, threads: null };
-  try { td = await api('GET', `/api/runs/${r.id}/timeline-detail${qs}`); } catch { /* no samples */ }
-  // Filtered summary when a group is picked; otherwise the stored whole-run summary.
-  let s = r.summary;
-  if (tg) { try { s = await api('GET', `/api/runs/${r.id}/summary${qs}`); } catch { s = null; } }
-  const o = s ? s.overall : null;
-  const vu = runVUsers(r);
-  const isArr = r.rateKind === 'arrivals' || r.rateKind === 'mixed';
-  const metrics = [
-    { k: isArr ? 'Peak active threads' : 'Virtual users (max)', v: (td.threads ? fmt.n(Math.max(0, ...td.threads)) : (vu != null ? fmt.n(vu) : '–')), ic: 'layers' },
-    { k: 'Response time (p90)', v: o ? fmt.ms(o.p90) : '–', ic: 'gauge' },
-    { k: 'Requests / sec', v: o ? fmt.tp(o.throughput) : '–', ic: 'bolt' },
-    { k: 'Total requests', v: o ? fmt.n(o.samples) : '–', ic: 'cube' },
-    { k: 'Errors', v: o ? fmt.n(o.errors) : '–', tone: o && o.errors ? 'bad' : 'good', ic: 'fail' },
-  ];
-  body.innerHTML = `<div class="metric-row">${metrics.map(metricCard).join('')}</div>`
-    + (s && td.t.length
-      ? azChartsHtml('az', td, s, vu, r.rateKind)
-        + (o && o.errors ? `<div id="dashErrDiag" class="err-diag"><p class="empty" style="text-align:left">loading error breakdown…</p></div>` : '')
-        + `<details class="dash-agg" open><summary>Aggregate report</summary>${aggregateTable(s)}</details>`
-      : `<p class="empty">No samples${tg ? ' for this thread group' : ''}.</p>`);
-  if (s && td.t.length) azChartsDraw('az', td, vu, r.rateKind);
-  if (o && o.errors) loadErrorDiag(r.id, tg);
-}
-
-// Error-diagnosis panel: the endpoints that actually failed, grouped by
-// response code + message, worst-first — "what's dying" without digging.
-async function loadErrorDiag(id, tg) {
-  const el = document.getElementById('dashErrDiag');
-  if (!el) return;
-  try {
-    const d = await api('GET', `/api/runs/${id}/error-summary${tg ? `?tg=${encodeURIComponent(tg)}` : ''}`);
-    if (!d.groups || !d.groups.length) { el.innerHTML = '<p class="empty" style="text-align:left">No error details recorded for this run.</p>'; return; }
-    const top = d.groups.slice(0, 12);
-    el.innerHTML = `
-      <h3 class="err-diag-h">${ic('warn')} Top failing requests <span class="hint" style="margin:0">${fmt.n(d.totalErrors)} errors in ${fmt.n(d.totalSamples)} samples</span></h3>
-      <div class="err-diag-wrap"><table class="err-diag-table">
-        <thead><tr><th>Request</th><th>Code</th><th>Message</th><th class="num">Count</th><th class="num">% of errors</th></tr></thead>
-        <tbody>${top.map((g) => {
-          const pct = d.totalErrors ? (100 * g.count / d.totalErrors) : 0;
-          const message = (g.msg || g.failure || '').trim();
-          return `<tr>
-            <td>${esc(g.label)}</td>
-            <td><span class="err-code">${esc(g.code || '–')}</span></td>
-            <td class="err-msg" title="${esc(message)}">${esc(message.slice(0, 140) || '–')}</td>
-            <td class="num">${fmt.n(g.count)}</td>
-            <td class="num"><span class="err-bar" style="--p:${pct.toFixed(0)}%"></span>${pct.toFixed(1)}%</td>
-          </tr>`;
-        }).join('')}</tbody>
-      </table></div>
-      ${d.groups.length > 12 ? `<p class="hint" style="margin:6px 0 0">+ ${d.groups.length - 12} more error type${d.groups.length - 12 > 1 ? 's' : ''}</p>` : ''}`;
-  } catch (e) {
-    el.innerHTML = `<p class="empty" style="text-align:left">Could not load error breakdown: ${esc(e.message)}</p>`;
-  }
-}
-
 // Run detail — the classic JMeter listener views computed from the stored
 // results: throughput/latency charts, Aggregate Report, Summary Report,
 // View Results in Table, and a per-agent breakdown. The agent selector
@@ -2422,117 +3196,6 @@ function filterQs() {
   return q.toString();
 }
 
-window.deleteRun = async (id, ev) => {
-  ev.stopPropagation();
-  if (!confirm(`Delete run ${id}?\nIts results, reports and logs are removed permanently.`)) return;
-  try {
-    await api('DELETE', `/api/runs/${id}`);
-    if (detailState.id === id) { $('runDetail').innerHTML = ''; detailState.id = null; }
-    loadHistory();
-  } catch (e) {
-    alert(`Delete failed: ${e.message}`);
-  }
-};
-
-$('clearRuns').onclick = async () => {
-  const runs = await api('GET', '/api/runs');
-  if (!runs.length) return;
-  if (!confirm(`Delete ALL ${runs.length} runs from history?\nThis cannot be undone.`)) return;
-  for (const r of runs) {
-    try { await api('DELETE', `/api/runs/${r.id}`); } catch { /* skip active run */ }
-  }
-  $('runDetail').innerHTML = '';
-  detailState.id = null;
-  loadHistory();
-};
-
-window.showRunDetail = async (id) => {
-  const r = await api('GET', `/api/runs/${id}`);
-  Object.assign(detailState, { id, offset: 0, errorsOnly: false, agent: '', tg: '', summary: r.summary, agentSummaries: null, rateKind: r.rateKind });
-  const s = r.summary;
-  const uploadedAgents = (r.agents || []).filter((a) => a.uploaded).map((a) => a.name);
-  const links = [
-    r.hasReport ? `<a href="/runs-static/${id}/report/index.html" target="_blank">JMeter HTML dashboard</a>` : '',
-    r.hasMerged ? `<a href="/api/runs/${id}/merged.jtl">Download merged .jtl</a>` : '',
-    `<a href="/api/runs/${id}/log" target="_blank">Run log</a>`,
-  ].filter(Boolean).join(' · ');
-  $('runDetail').innerHTML = `
-    <div class="card" id="printArea">
-      <h2>${esc(r.planName || '')} — ${id} <span class="state ${r.state}">${r.state}</span>
-        ${s && s.overall && s.overall.samples ? `<button class="ghost mini" id="histSendSheet" data-id="${esc(id)}" style="margin-left:auto;">${ic('download')} Send to Sheet</button>` : ''}
-        <button class="ghost mini" id="printRun" ${s && s.overall && s.overall.samples ? '' : 'style="margin-left:auto;"'}>${ic('printer')} Print</button></h2>
-      <p style="color:var(--muted)">${fmt.dt(r.createdAt)} → ${fmt.dt(r.endedAt)}
-        · <b style="color:var(--ink)">${ic('clock')} ${fmt.dur(s ? s.durationSec : r.endedAt ? (new Date(r.endedAt) - new Date(r.createdAt)) / 1000 : null)}</b>
-        · agents: ${(r.agents || []).map((a) => `${esc(a.name)}${a.error ? ` (${esc(a.error)})` : ''}`).join(', ')}</p>
-      <p>${links}</p>
-      ${s ? `
-      <div style="display:flex; gap:16px; flex-wrap:wrap;">
-        ${uploadedAgents.length > 1 ? `
-        <label class="field">Agent
-          <select id="agentSel">
-            <option value="">All agents (merged)</option>
-            ${uploadedAgents.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}
-          </select>
-        </label>` : ''}
-        ${(r.tgNames || []).length > 1 ? `
-        <label class="field">Thread group
-          <select id="tgSel">
-            <option value="">All thread groups</option>
-            ${r.tgNames.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}
-          </select>
-        </label>` : ''}
-      </div>
-      <div id="dazCharts" style="margin-bottom:14px;"></div>
-      <div class="subtabs">
-        <button class="active" data-tab="aggregate">Aggregate Report</button>
-        <button data-tab="summary">Summary Report</button>
-        <button data-tab="table" ${r.hasMerged ? '' : 'disabled title="needs merged results"'}>View Results in Table</button>
-        ${uploadedAgents.length ? '<button data-tab="agents">Per Agent</button>' : ''}
-        <button data-tab="errors">Error Responses</button>
-      </div>
-      <div id="tab-aggregate" class="subtab active"></div>
-      <div id="tab-summary" class="subtab"></div>
-      <div id="tab-table" class="subtab">
-        <div class="sampler-tools" style="margin-bottom:8px;">
-          <label class="df-header"><input type="checkbox" id="errOnly"> errors only</label>
-          <button class="ghost mini" id="pgPrev">← Prev</button>
-          <span id="pgInfo" class="hint" style="margin:0"></span>
-          <button class="ghost mini" id="pgNext">Next →</button>
-        </div>
-        <div id="samplesBox"></div>
-      </div>
-      <div id="tab-agents" class="subtab"></div>
-      <div id="tab-errors" class="subtab"></div>` : '<p class="empty">No summary (run produced no samples)</p>'}
-    </div>`;
-
-  if (!s) return;
-  renderDetailTables(s);
-  loadDetailCharts(s);
-
-  document.querySelectorAll('.subtabs button').forEach((b) => {
-    b.onclick = () => {
-      if (b.disabled) return;
-      document.querySelectorAll('.subtabs button').forEach((x) => x.classList.toggle('active', x === b));
-      document.querySelectorAll('.subtab').forEach((x) => x.classList.toggle('active', x.id === `tab-${b.dataset.tab}`));
-      if (b.dataset.tab === 'table' && !$('samplesBox').innerHTML) loadSamples();
-      if (b.dataset.tab === 'agents' && !$('tab-agents').innerHTML) loadAgentsTab();
-      if (b.dataset.tab === 'errors' && !$('tab-errors').innerHTML) loadErrorsTab();
-    };
-  });
-  $('errOnly').onchange = () => { detailState.errorsOnly = $('errOnly').checked; detailState.offset = 0; loadSamples(); };
-  $('pgPrev').onclick = () => { detailState.offset = Math.max(0, detailState.offset - detailState.pageSize); loadSamples(); };
-  $('pgNext').onclick = () => { detailState.offset += detailState.pageSize; loadSamples(); };
-  const selA = $('agentSel');
-  if (selA) selA.onchange = () => { detailState.agent = selA.value; detailState.offset = 0; refreshDetailData(); };
-  const selT = $('tgSel');
-  if (selT) selT.onchange = () => { detailState.tg = selT.value; detailState.offset = 0; refreshDetailData(); };
-  const pb = $('printRun');
-  if (pb) pb.onclick = () => printRunDetail(r);
-  const hss = $('histSendSheet');
-  if (hss) hss.onclick = () => sendRunToSheet(id, hss);
-  $('runDetail').scrollIntoView({ behavior: 'smooth' });
-};
-
 /**
  * Print the run detail as a clean report: header, both charts (rendered to
  * images so they survive into the print window), and the Aggregate + Summary +
@@ -2543,7 +3206,7 @@ async function printRunDetail(r) {
     .filter(Boolean).join(' · ');
   const chartImg = (id) => { const c = $(id); return c ? `<img src="${c.toDataURL('image/png')}" style="width:100%;max-width:720px;border:1px solid #ccc">` : ''; };
   // ensure per-agent table is loaded for the printout
-  if (!$('tab-agents').innerHTML) await loadAgentsTab();
+  if ($('tab-agents') && !$('tab-agents').innerHTML) await loadAgentsTab();
 
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(r.planName || 'Run')} — ${esc(r.id)}</title>
     <style>
@@ -2567,7 +3230,7 @@ async function printRunDetail(r) {
     <h2>Errors (by sampler)</h2><div class="charts">${chartImg('dazErr')}</div>
     <h2>Aggregate Report</h2>${$('tab-aggregate').innerHTML}
     <h2>Summary Report</h2>${$('tab-summary').innerHTML}
-    ${$('tab-agents').innerHTML ? `<h2>Per Agent</h2>${$('tab-agents').innerHTML}` : ''}
+    ${$('tab-agents') && $('tab-agents').innerHTML ? `<h2>Per Agent</h2>${$('tab-agents').innerHTML}` : ''}
     <script>window.onload=()=>{setTimeout(()=>window.print(),300);}<\/script>
     </body></html>`;
   const w = window.open('', '_blank');
@@ -2576,117 +3239,38 @@ async function printRunDetail(r) {
   w.document.close();
 }
 
-/** Re-render every detail view for the current agent/thread-group filter. */
-async function refreshDetailData() {
-  let s = detailState.summary;
-  if (detailState.agent || detailState.tg) {
-    try { s = await api('GET', `/api/runs/${detailState.id}/summary?${filterQs()}`); } catch { s = detailState.summary; }
-  }
-  renderDetailTables(s);
-  loadDetailCharts(s);
-  if ($('samplesBox').innerHTML) loadSamples();
-  if ($('tab-errors') && $('tab-errors').innerHTML) loadErrorsTab();
-  if ($('tab-agents') && $('tab-agents').innerHTML) loadAgentsTab();
-}
-
 function renderDetailTables(s) {
   $('tab-aggregate').innerHTML = aggregateTable(s);
   $('tab-summary').innerHTML = summaryTable(s);
 }
 
+// A run-detail loader's answer is stale once another run was opened or a newer
+// load of the same kind started (filters changed again) — it must not overwrite.
+function rdToken(kind) {
+  const toks = detailState.tok || (detailState.tok = {});
+  const n = (toks[kind] = (toks[kind] || 0) + 1);
+  const seq = detailState.seq;
+  return () => seq === detailState.seq && n === toks[kind];
+}
+
 async function agentSummaries() {
-  // cache per thread-group filter, so the Per Agent tab follows the dropdown
-  const key = detailState.tg || '';
-  if (!detailState.agentSummaries || detailState.agentSummaries.key !== key) {
-    const q = key ? `?tg=${encodeURIComponent(key)}` : '';
-    detailState.agentSummaries = { key, data: await api('GET', `/api/runs/${detailState.id}/agents-summary${q}`) };
-  }
-  return detailState.agentSummaries.data;
-}
-
-async function loadDetailCharts(summary) {
-  const el = $('dazCharts');
-  if (!el) return;
-  try {
-    const td = await api('GET', `/api/runs/${detailState.id}/timeline-detail?${filterQs()}`);
-    if (!td.t.length) { el.innerHTML = '<p class="empty" style="text-align:left">No timeline for this filter.</p>'; return; }
-    el.innerHTML = azChartsHtml('daz', td, summary || detailState.summary, null, detailState.rateKind);
-    azChartsDraw('daz', td, null, detailState.rateKind);
-  } catch {
-    el.innerHTML = '<p class="empty" style="text-align:left">Could not load charts.</p>';
-  }
-}
-
-// One captured error occurrence: the full REQUEST (method, URL, body, headers,
-// cookies) that was sent, then the RESPONSE — everything needed to reproduce it.
-function errorExampleHtml(e, i) {
-  return `<div class="err-example">
-    <div class="err-example-head">Example ${i + 1} · agent ${esc(e.agent)} · thread ${esc(e.thread)} · ${new Date(e.t).toLocaleTimeString('en-GB')} · ${e.elapsed} ms</div>
-    <div class="err-req">
-      <b>▶ Request</b>
-      <div><span class="k">${esc(e.method || 'GET')}</span> ${esc(e.url || '(url not captured)')}</div>
-      ${e.requestData ? `<details open><summary>Request body / parameters</summary><pre class="resp-body">${esc(e.requestData)}</pre></details>` : '<div class="hint" style="margin:2px 0">no request body</div>'}
-      ${e.requestHeaders ? `<details><summary>Request headers</summary><pre class="resp-body">${esc(e.requestHeaders)}</pre></details>` : ''}
-      ${e.cookies ? `<details><summary>Cookies</summary><pre class="resp-body">${esc(e.cookies)}</pre></details>` : ''}
-    </div>
-    <div class="err-res">
-      <b>◀ Response</b> <span class="err-code">${esc(e.code)} ${esc(e.msg)}</span>
-      ${e.assertion ? `<div style="color:var(--critical)"><b>Assertion failure:</b> ${esc(e.assertion)}</div>` : ''}
-      ${e.responseHeaders ? `<details><summary>Response headers</summary><pre class="resp-body">${esc(e.responseHeaders)}</pre></details>` : ''}
-      <details open><summary>Response body</summary><pre class="resp-body">${e.responseBody ? esc(e.responseBody) : '(empty)'}</pre></details>
-    </div>
-  </div>`;
-}
-
-// Error Responses — every DISTINCT error type with its true count across the
-// whole run (grouped like JMeter's error summary), plus a captured example
-// response per type. No error type gets lost behind thousands of duplicates.
-async function loadErrorsTab() {
-  $('tab-errors').innerHTML = '<p class="empty">loading…</p>';
-  try {
-    const d = await api('GET', `/api/runs/${detailState.id}/error-summary?${filterQs()}`);
-    if (!d.totalErrors) {
-      $('tab-errors').innerHTML = '<p class="empty">No failed samples in this run 🎉</p>';
-      return;
-    }
-    $('tab-errors').innerHTML = `
-      <p class="hint" style="margin:0 0 10px;">${fmt.n(d.totalErrors)} failed samples (${(100 * d.totalErrors / d.totalSamples).toFixed(2)}% of ${fmt.n(d.totalSamples)})
-        grouped into <b>${d.groups.length} distinct error type(s)</b>. Click a row to see captured request + response examples.
-        ${d.captureTruncated ? ' <b style="color:var(--warning)">Some capture files were too large to fully parse.</b>' : ''}</p>
-      <table>
-        <thead><tr><th>Sampler</th><th>Code</th><th>Message</th><th>Assertion / failure</th><th class="num">Count</th><th class="num">Examples</th></tr></thead>
-        <tbody>${d.groups.map((g) => `
-          <tr class="sample-row">
-            <td>${esc(g.label)}</td>
-            <td style="color:var(--critical); font-weight:600">${esc(g.code) || '–'}</td>
-            <td>${esc(g.msg) || '–'}</td>
-            <td>${esc(g.failure) || '–'}</td>
-            <td class="num" style="font-weight:650">${fmt.n(g.count)}</td>
-            <td class="num">${g.examples.length}${g.examples.length >= 25 ? '+' : ''}</td>
-          </tr>
-          <tr class="sample-detail" style="display:none"><td colspan="6">
-            <div class="hint" style="margin:0 0 8px;">First seen ${new Date(g.firstTs).toLocaleTimeString('en-GB')} · last seen ${new Date(g.lastTs).toLocaleTimeString('en-GB')}
-              · showing ${g.examples.length} captured example(s) of ${fmt.n(g.count)}</div>
-            ${g.examples.length ? g.examples.map((e, i) => errorExampleHtml(e, i)).join('') :
-              '<span class="hint" style="margin:0">No captured example — the response capture for this type was lost (e.g. an agent’s upload failed). Re-run to capture it.</span>'}
-          </td></tr>`).join('')}
-        </tbody>
-      </table>`;
-    document.querySelectorAll('#tab-errors .sample-row').forEach((tr) => {
-      tr.onclick = () => {
-        const det = tr.nextElementSibling;
-        det.style.display = det.style.display === 'none' ? '' : 'none';
-      };
-    });
-  } catch (e) {
-    $('tab-errors').innerHTML = `<p class="empty">${esc(e.message)}</p>`;
-  }
+  // cache per run + thread-group filter, so the Per Agent tab follows the dropdown
+  const keyNow = () => `${detailState.id}|${detailState.tg || ''}`;
+  const key = keyNow();
+  const c = detailState.agentSummaries;
+  if (c && c.key === key) return c.data;
+  const q = detailState.tg ? `?tg=${encodeURIComponent(detailState.tg)}` : '';
+  const data = await api('GET', `/api/runs/${detailState.id}/agents-summary${q}`);
+  if (keyNow() === key) detailState.agentSummaries = { key, data };
+  return data;
 }
 
 async function loadAgentsTab() {
+  const current = rdToken('agents');
   $('tab-agents').innerHTML = '<p class="empty">loading…</p>';
   try {
     const per = await agentSummaries();
+    if (!current()) return;
     // flag an agent whose avg response is a wild outlier vs the fastest (slow network path)
     const avgs = per.map((a) => a.overall.avg).filter((v) => v > 0);
     const fastest = avgs.length ? Math.min(...avgs) : 0;
@@ -2711,9 +3295,9 @@ async function loadAgentsTab() {
           </tr>`).join('')}
         </tbody>
       </table>
-      <p class="hint">Use the "Showing results of" selector above to switch the charts, reports and results table to a single agent.</p>`;
+      <p class="hint">Use the Agent filter at the top of the page to see one agent's charts and tables.</p>`;
   } catch (e) {
-    $('tab-agents').innerHTML = `<p class="empty">${esc(e.message)}</p>`;
+    if (current()) $('tab-agents').innerHTML = `<p class="empty">${esc(e.message)}</p>`;
   }
 }
 
@@ -2756,10 +3340,12 @@ function summaryTable(s) {
 }
 
 async function loadSamples() {
+  const current = rdToken('samples');
   $('samplesBox').innerHTML = '<p class="empty">loading…</p>';
   try {
     const d = await api('GET', `/api/runs/${detailState.id}/samples?offset=${detailState.offset}&limit=${detailState.pageSize}` +
       `${detailState.errorsOnly ? '&errors=1' : ''}&${filterQs()}`);
+    if (!current()) return;
     $('pgInfo').textContent = `rows ${detailState.offset + 1}–${detailState.offset + d.rows.length}${d.hasMore ? '+' : ''}`;
     $('pgPrev').disabled = detailState.offset === 0;
     $('pgNext').disabled = !d.hasMore;
@@ -2789,9 +3375,669 @@ async function loadSamples() {
       };
     });
   } catch (e) {
-    $('samplesBox').innerHTML = `<p class="empty">${esc(e.message)}</p>`;
+    if (current()) $('samplesBox').innerHTML = `<p class="empty">${esc(e.message)}</p>`;
   }
 }
+
+// ---------------- run detail: one page per run (#run/<id>) ----------------
+
+function shortStamp(iso) {
+  return `${new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })} ${timeOnly(iso)}`;
+}
+function longStamp(iso) {
+  return new Date(iso).toLocaleString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+async function openRun(id, opts = {}) {
+  showView('run', { ...opts, hash: `run/${encodeURIComponent(id)}` });
+  const page = $('runPage');
+  const seq = (detailState.seq = (detailState.seq || 0) + 1);
+  page.innerHTML = '<div class="card"><p class="empty">Loading run…</p></div>';
+  let r;
+  try { r = await api('GET', `/api/runs/${encodeURIComponent(id)}`); } catch (e) {
+    page.innerHTML = `<div class="card empty-state"><b>This run can't be opened</b><span>${esc(e.message)}</span><a class="link-btn" href="#runs">Back to all runs</a></div>`;
+    return;
+  }
+  await ensureSla();
+  if (seq !== detailState.seq) return; // user already opened another run
+  r.overall = r.summary ? r.summary.overall : null; // same shape as the list, so SLA/result badges agree
+  Object.assign(detailState, {
+    id, r, offset: 0, errorsOnly: false, agent: '', tg: '', summary: r.summary, cur: r.summary,
+    agentSummaries: null, rateKind: r.rateKind,
+  });
+  $('crumb').textContent = `Results / Runs / ${shortStamp(r.createdAt)}`;
+  document.title = `${r.planName || 'Run'} · ${shortStamp(r.createdAt)} · LoadPilot`;
+
+  const s = r.summary;
+  const hasSamples = !!(s && s.overall && s.overall.samples);
+  const agents = r.agents || [];
+  const uploadedAgents = agents.filter((a) => a.uploaded).map((a) => a.name);
+  const dur = s ? s.durationSec : r.endedAt ? (new Date(r.endedAt) - new Date(r.createdAt)) / 1000 : null;
+  const names = agents.map((a) => a.name);
+  const agentsTxt = names.length <= 3 ? `${names.length} agent${names.length === 1 ? '' : 's'} (${names.join(', ')})` : `${names.length} agents`;
+  const mode = r.config && r.config.mode === 'per-agent' ? 'per-agent profiles' : 'split evenly';
+  const target = (r.targets || [])[0];
+  const agentErrors = agents.filter((a) => a.error);
+  const errs = hasSamples ? s.overall.errors : 0;
+
+  page.innerHTML = `
+    <div class="card run-head" id="printArea">
+      <div class="run-head-top">
+        <div class="run-head-text">
+          <h2 class="run-title">${esc(r.planName || 'Run')} ${resultBadge(r)}${errs ? ` <span class="rbadge bad-soft">${fmt.n(errs)} failed request${errs === 1 ? '' : 's'}</span>` : ''}</h2>
+          <p class="run-meta">${esc(longStamp(r.createdAt))} · ran ${durHuman(dur)} · <span title="${esc(names.join(', '))}">${esc(agentsTxt)}</span> · ${mode}${target ? ` · target <b>${esc(target)}</b>` : ''}</p>
+          ${agentErrors.length ? `<p class="run-warn">${ic('warn')} ${agentErrors.map((a) => `<b>${esc(a.name)}</b>: ${esc(a.error)}`).join(' · ')}</p>` : ''}
+        </div>
+        <div class="run-actions">
+          <button type="button" class="primary" id="rdAgain" ${r.planId ? '' : 'disabled'} title="Open New run with this plan, workload and agents">Run again</button>
+          ${r.hasReport ? `<a class="btn-ghost" href="/runs-static/${encodeURIComponent(id)}/report/index.html" target="_blank" rel="noopener">JMeter report</a>` : ''}
+          ${hasSamples ? `<button type="button" class="ghost" id="histSendSheet">Send to Google Sheet</button>` : ''}
+          <details class="menu">
+            <summary class="btn-ghost" aria-label="More actions">More</summary>
+            <div class="menu-pop">
+              ${r.hasMerged ? `<a href="/api/runs/${encodeURIComponent(id)}/merged.jtl">Download results (.jtl)</a>` : ''}
+              <a href="/api/runs/${encodeURIComponent(id)}/log" target="_blank" rel="noopener">Open run log</a>
+              ${hasSamples ? '<button type="button" id="printRun">Print report</button>' : ''}
+              <button type="button" id="rdDelete" class="danger-item">Delete run</button>
+            </div>
+          </details>
+        </div>
+      </div>
+      ${hasSamples && ((r.tgNames || []).length > 1 || uploadedAgents.length > 1) ? `
+      <div class="rd-filters">
+        ${(r.tgNames || []).length > 1 ? `<label class="rf"><span>Thread group</span><select id="tgSel">
+          <option value="">All thread groups</option>${r.tgNames.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</select></label>` : ''}
+        ${uploadedAgents.length > 1 ? `<label class="rf"><span>Agent</span><select id="agentSel">
+          <option value="">All agents (merged)</option>${uploadedAgents.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</select></label>` : ''}
+        <p class="rd-filter-note">Filters apply to every number, chart and table on this page. Throughput is always divided by the full run time, so filtered numbers stay comparable.</p>
+      </div>` : ''}
+    </div>
+    ${hasSamples ? `
+    <div class="kpi-row rd-kpis" id="rdKpis"></div>
+    <div class="card" id="rdSla"></div>
+    <div class="card"><h2>Over time</h2><div id="dazCharts"><p class="empty">Loading charts…</p></div></div>
+    <div class="card rd-tabs-card">
+      <div class="tabbar" role="tablist" aria-label="Run results">
+        <button type="button" role="tab" data-tab="aggregate" class="on" aria-selected="true">Aggregate report</button>
+        <button type="button" role="tab" data-tab="errors" id="rdErrTab">Errors · ${fmt.n(errs)}</button>
+        ${uploadedAgents.length ? '<button type="button" role="tab" data-tab="agents">Per agent</button>' : ''}
+        <button type="button" role="tab" data-tab="summary">Summary report</button>
+        <button type="button" role="tab" data-tab="table" ${r.hasMerged ? '' : 'disabled title="Needs the merged results file"'}>All requests</button>
+      </div>
+      <div id="tab-aggregate" class="subtab active"></div>
+      <div id="tab-errors" class="subtab"></div>
+      <div id="tab-agents" class="subtab"></div>
+      <div id="tab-summary" class="subtab"></div>
+      <div id="tab-table" class="subtab">
+        <div class="sampler-tools">
+          <label class="df-header"><input type="checkbox" id="errOnly"> Failed requests only</label>
+          <button type="button" class="ghost mini" id="pgPrev">← Previous</button>
+          <span id="pgInfo" class="hint" style="margin:0"></span>
+          <button type="button" class="ghost mini" id="pgNext">Next →</button>
+        </div>
+        <div id="samplesBox"></div>
+      </div>
+    </div>` : `
+    <div class="card empty-state"><b>This run recorded no results</b>
+      <span>${r.state === 'error' ? 'It failed before any request was sent — the run log usually says why.' : 'No requests were sent.'}</span>
+      <a class="link-btn" href="/api/runs/${encodeURIComponent(id)}/log" target="_blank" rel="noopener">Open run log</a></div>`}`;
+
+  $('rdAgain').onclick = () => runAgain(r, $('rdAgain'));
+  $('rdDelete').onclick = async () => {
+    if (!confirm(`Delete this run?\nIts results, reports and logs are removed permanently.`)) return;
+    try { await api('DELETE', `/api/runs/${encodeURIComponent(id)}`); showView('runs'); } catch (e) { alert(`Delete failed: ${e.message}`); }
+  };
+  const hss = $('histSendSheet');
+  if (hss) hss.onclick = () => sendRunToSheet(id, hss);
+  if (!hasSamples) return;
+  $('printRun').onclick = () => printRunDetail(r);
+  page.querySelectorAll('.tabbar [data-tab]').forEach((b) => (b.onclick = () => rdTab(b.dataset.tab)));
+  $('errOnly').onchange = () => { detailState.errorsOnly = $('errOnly').checked; detailState.offset = 0; loadSamples(); };
+  $('pgPrev').onclick = () => { detailState.offset = Math.max(0, detailState.offset - detailState.pageSize); loadSamples(); };
+  $('pgNext').onclick = () => { detailState.offset += detailState.pageSize; loadSamples(); };
+  if ($('agentSel')) $('agentSel').onchange = () => { detailState.agent = $('agentSel').value; detailState.offset = 0; rdRefresh(); };
+  if ($('tgSel')) $('tgSel').onchange = () => { detailState.tg = $('tgSel').value; detailState.offset = 0; rdRefresh(); };
+  renderRdSla();
+  rdRefresh();
+  window.scrollTo({ top: 0 });
+}
+
+function rdTab(name) {
+  document.querySelectorAll('#runPage .tabbar [data-tab]').forEach((b) => {
+    const on = b.dataset.tab === name;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  document.querySelectorAll('#runPage .subtab').forEach((x) => x.classList.toggle('active', x.id === `tab-${name}`));
+  if (name === 'table' && !$('samplesBox').innerHTML) loadSamples();
+  if (name === 'agents' && !$('tab-agents').innerHTML) loadAgentsTab();
+  if (name === 'errors' && !$('tab-errors').dataset.loaded) loadErrorsTab();
+}
+
+// Every number, chart and table for the current agent / thread-group filter.
+async function rdRefresh() {
+  const current = rdToken('refresh');
+  const r = detailState.r;
+  let s = detailState.summary;
+  if (detailState.agent || detailState.tg) {
+    try { s = await api('GET', `/api/runs/${detailState.id}/summary?${filterQs()}`); } catch { s = null; }
+  }
+  let td = { t: [], labels: [], series: {}, threads: null };
+  try { td = await api('GET', `/api/runs/${detailState.id}/timeline-detail?${filterQs()}`); } catch { /* no timeline */ }
+  if (!current()) return;
+  detailState.cur = s;
+  const hasData = !!(s && s.overall && s.overall.samples);
+  renderRdKpis(hasData ? s : null, td);
+  const vu = runVUsers(r);
+  const charts = $('dazCharts');
+  if (hasData && td.t.length) {
+    charts.innerHTML = azChartsHtml('daz', td, s, vu, detailState.rateKind);
+    azChartsDraw('daz', td, vu, detailState.rateKind);
+  } else {
+    charts.innerHTML = `<div class="empty-state"><b>No results for this ${detailState.tg ? 'thread group' : 'selection'}</b>
+      <span>${detailState.tg ? `“${esc(detailState.tg)}” sent no requests in this run — it was probably switched off.` : 'Nothing was recorded for this filter.'}</span></div>`;
+  }
+  if (hasData) renderDetailTables(s);
+  else { $('tab-aggregate').innerHTML = '<p class="empty">No requests for this filter.</p>'; $('tab-summary').innerHTML = ''; }
+  $('rdErrTab').textContent = `Errors · ${fmt.n(hasData ? s.overall.errors : 0)}`;
+  if ($('samplesBox').innerHTML) loadSamples();
+  if ($('tab-errors').dataset.loaded) loadErrorsTab();
+  if ($('tab-agents') && $('tab-agents').innerHTML) loadAgentsTab();
+}
+
+function renderRdKpis(s, td) {
+  const r = detailState.r;
+  const o = s && s.overall;
+  const n = (r.agents || []).length;
+  const split = n > 1 && !detailState.agent;
+  const vu = runVUsers(r);
+  const peak = td && td.threads && td.threads.length ? Math.max(0, ...td.threads) : vu;
+  const isArr = r.rateKind === 'arrivals' || r.rateKind === 'mixed';
+  const cards = [
+    { k: isArr ? 'Peak active threads' : 'Peak users', v: peak != null ? fmt.n(peak) : '–', sub: peak && split ? `≈ ${fmt.n(Math.round(peak / n))} on each agent` : '' },
+    { k: 'Throughput', v: o ? `${o.throughput} req/s` : '–', sub: o ? `Over ${durHuman(s.durationSec)}` : '' },
+    { k: 'Response time p90', v: o ? msHuman(o.p90) : '–', sub: o ? `Average ${msHuman(o.avg)}` : '' },
+    { k: 'Requests', v: o ? fmt.n(o.samples) : '–', sub: o && split ? `≈ ${fmt.n(Math.round(o.samples / n))} per agent` : '' },
+    { k: 'Errors', v: o ? fmt.n(o.errors) : '–', sub: o ? `${o.errorPct}% of requests` : '', tone: o && o.errors ? 'bad' : '' },
+  ];
+  $('rdKpis').innerHTML = cards.map(kpiCard).join('');
+}
+
+// SLA limits are global (every run is judged by them); checked on the WHOLE run.
+function renderRdSla(editing) {
+  const el = $('rdSla');
+  if (!el) return;
+  const r = detailState.r;
+  const o = r.summary && r.summary.overall;
+  const t = slaThresholds || {};
+  if (editing) {
+    el.innerHTML = `<h2>SLA limits</h2>
+      <p class="hint" style="margin:0 0 12px;">These limits judge <b>every</b> run as passed or failed. Leave a box empty for no limit.</p>
+      <div class="sla-form">
+        <label class="rf"><span>Error rate at most (%)</span><input id="slaErr" type="number" min="0" step="0.1" value="${t.maxErrorPct ?? ''}" placeholder="no limit"></label>
+        <label class="rf"><span>p90 response time at most (ms)</span><input id="slaP90" type="number" min="0" step="10" value="${t.maxP90Ms ?? ''}" placeholder="no limit"></label>
+        <label class="rf"><span>Throughput at least (req/s)</span><input id="slaTp" type="number" min="0" step="1" value="${t.minThroughput ?? ''}" placeholder="no limit"></label>
+      </div>
+      <div class="sla-form-actions"><button type="button" class="primary" id="slaSave">Save limits</button>
+        <button type="button" class="ghost" id="slaCancel">Cancel</button><span id="slaMsg" class="hint" style="margin:0"></span></div>`;
+    $('slaCancel').onclick = () => renderRdSla();
+    $('slaSave').onclick = async () => {
+      const val = (id) => ($(id).value === '' ? null : Number($(id).value));
+      try {
+        const d = await api('PUT', '/api/sla', { maxErrorPct: val('slaErr'), maxP90Ms: val('slaP90'), minThroughput: val('slaTp') });
+        slaThresholds = d.sla;
+        renderRdSla();
+        // the header badge depends on the limits too
+        const badge = document.querySelector('#runPage .run-title .rbadge');
+        if (badge) badge.outerHTML = resultBadge(r);
+      } catch (e) { $('slaMsg').textContent = e.message; }
+    };
+    return;
+  }
+  const v = slaVerdict(r);
+  const row = (name, limit, ok, rule, actual) => limit == null
+    ? `<li class="sla-off"><span class="sla-ic">–</span><span><b>${name}</b> · no limit set</span></li>`
+    : `<li class="${ok ? 'sla-ok' : 'sla-bad'}"><span class="sla-ic">${ok ? ic('check') : ic('fail')}</span><span><b>${name} ${rule}</b> · ${actual}</span></li>`;
+  el.innerHTML = `<h2>SLA checks <span class="rbadge ${v === 'pass' ? 'ok' : v === 'fail' ? 'bad' : 'neutral'}">${v === 'pass' ? 'Passed' : v === 'fail' ? 'Failed' : 'No limits set'}</span>
+      <button type="button" class="link-btn" id="slaEdit" style="margin-left:auto;">Edit SLA limits</button></h2>
+    ${o ? `<ul class="sla-list">
+      ${row('Error rate', t.maxErrorPct, o.errorPct <= t.maxErrorPct, `at most ${t.maxErrorPct}%`, `${o.errorPct}% in this run`)}
+      ${row('p90 response time', t.maxP90Ms, o.p90 <= t.maxP90Ms, `at most ${msHuman(t.maxP90Ms)}`, `${msHuman(o.p90)} in this run`)}
+      ${row('Throughput', t.minThroughput, o.throughput >= t.minThroughput, `at least ${t.minThroughput} req/s`, `${o.throughput} req/s in this run`)}
+    </ul>` : ''}
+    ${detailState.agent || detailState.tg ? '<p class="hint" style="margin:8px 0 0">Checked on the whole run, not the current filter.</p>' : ''}`;
+  $('slaEdit').onclick = () => renderRdSla(true);
+}
+
+// "Run again": the same plan, workload, variables and agents, opened on the
+// Review step so nothing starts until you press Start.
+async function runAgain(r, btn = $('rdAgain')) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Opening…';
+  let plan;
+  try { plan = await api('GET', `/api/plans/${encodeURIComponent(r.planId)}`); } catch (e) {
+    alert(`The plan for this run is no longer available (${e.message}). Upload it again on New run.`);
+    btn.disabled = false; btn.textContent = label;
+    return;
+  }
+  const c = r.config || {};
+  applyLoadedPlan(plan);
+  state.agentChoice = new Set(c.agents || []);
+  renderAgentPick();
+  if (c.mode === 'per-agent' && c.agentConfigs) {
+    state.profiles = JSON.parse(JSON.stringify(c.agentConfigs));
+    state.distMode = 'per-agent';
+    state.editingAgent = (c.agents || [])[0] || null;
+    const radio = document.querySelector('input[name="distMode"][value="per-agent"]');
+    if (radio) radio.checked = true;
+    if (state.editingAgent) applyFormConfig(state.profiles[state.editingAgent]);
+    updateDistUI();
+  } else {
+    applyFormConfig(c);
+  }
+  for (const [bid, vars] of Object.entries(c.variables || {})) {
+    for (const [name, value] of Object.entries(vars)) {
+      const inp = [...document.querySelectorAll('.var-input')].find((x) => x.dataset.block === String(bid) && x.dataset.name === name);
+      if (inp) inp.value = value;
+    }
+  }
+  if (c.heap) $('heap').value = c.heap;
+  if (c.liveInterval) $('liveInterval').value = String(c.liveInterval);
+  renderSplitPreview();
+  renderDataFiles();
+  showView('new');
+  wizGo(4);
+  btn.disabled = false; btn.textContent = label;
+}
+
+// ---------------- run detail: Errors tab ----------------
+// Failures grouped by sampler + code + reason with TRUE counts; one captured
+// example at a time with the request that was sent and the response that came back.
+
+const errView = { d: null, g: 0, i: 0, side: 'resp', body: 'source' };
+
+// Preview a captured HTML response without running or fetching anything from the
+// target: scripts, frames and external links are removed, then a strict CSP
+// inside a fully sandboxed iframe blocks whatever is left.
+function previewDoc(html) {
+  const clean = String(html)
+    .replace(/<script[\s\S]*?<\/script\s*>/gi, '')
+    .replace(/<(link|iframe|frame|object|embed|base|meta)\b[^>]*>/gi, '')
+    .replace(/<\/(iframe|object)\s*>/gi, '')
+    .replace(/\s(src|srcset|href|action|poster)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, ' data-blocked-$1=$2');
+  return `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">${clean}`;
+}
+
+async function loadErrorsTab() {
+  const box = $('tab-errors');
+  box.dataset.loaded = '1';
+  box.innerHTML = '<p class="empty">Loading errors…</p>';
+  const current = rdToken('errors');
+  let d;
+  try { d = await api('GET', `/api/runs/${detailState.id}/error-summary?${filterQs()}`); } catch (e) {
+    if (current()) $('tab-errors').innerHTML = `<p class="empty">${esc(e.message)}</p>`;
+    return;
+  }
+  if (!current()) return;
+  errView.d = d;
+  errView.g = 0; errView.i = 0;
+  renderErrorsTab();
+}
+
+function errKind(g) {
+  const code = String(g.code || '');
+  const text = `${code} ${g.msg || ''}`;
+  if (g.failure) return 'Assertion failed';
+  if (/timeout|timed out/i.test(text)) return 'Timed out';
+  if (/^\d{3}$/.test(code)) return Number(code) >= 500 ? 'Server error' : Number(code) >= 400 ? 'Request rejected' : 'Unexpected response';
+  if (/connect|refused|reset|unknownhost|ssl|socket|no route/i.test(text)) return 'Connection problem';
+  return 'Request failed';
+}
+
+// "Test failed: text expected not to contain /X/" → plain words + the pattern
+function explainAssertion(msg) {
+  const m = /expected (not )?to (contain|match|equal|be equal to|substring)\s*\/([\s\S]*)\/\s*$/i.exec(msg || '');
+  if (!m) return null;
+  const neg = !!m[1];
+  const what = /\bcode\b/i.test(msg) ? 'response code' : /header/i.test(msg) ? 'response headers' : 'response';
+  return {
+    pattern: m[3], neg,
+    text: neg ? `Response Assertion: the ${what} must not contain the text below, but it did.`
+      : `Response Assertion: the ${what} must contain the text below, but it didn't.`,
+    short: neg ? `The ${what} contained “${m[3].slice(0, 70)}”` : `The ${what} didn't contain “${m[3].slice(0, 70)}”`,
+  };
+}
+
+const decodeParam = (s) => { try { return decodeURIComponent(String(s).replace(/\+/g, ' ')); } catch { return s; } };
+function parseForm(str) {
+  if (!str || /[\r\n]/.test(str.trim()) || !str.includes('=')) return null;
+  const out = [];
+  for (const part of str.split('&')) {
+    const i = part.indexOf('=');
+    if (i <= 0) return null;
+    out.push([decodeParam(part.slice(0, i)), decodeParam(part.slice(i + 1))]);
+  }
+  return out;
+}
+const isGet = (e) => (e.method || 'GET').toUpperCase() === 'GET';
+function exParams(e) {
+  const out = [];
+  try { new URL(e.url).searchParams.forEach((v, k) => out.push([k, v])); } catch { /* no url */ }
+  if (!isGet(e)) (parseForm(e.requestData) || []).forEach((p) => out.push(p));
+  return out;
+}
+
+// Signs that the PLAN (not the server) caused the failure.
+function planProblems(g) {
+  if (g._probs) return g._probs;
+  const exs = g.examples || [];
+  const out = [];
+  const flagged = new Set();
+  for (const e of exs) {
+    for (const [k, v] of exParams(e)) {
+      if (flagged.has(k) || !(v === 'NOT_FOUND' || /\$\{[^}]+\}/.test(v))) continue;
+      flagged.add(k);
+      const n = exs.filter((x) => exParams(x).some(([k2, v2]) => k2 === k && v2 === v)).length;
+      out.push({ kind: v === 'NOT_FOUND' ? 'notfound' : 'literal', k, v, n });
+    }
+  }
+  // The same account sent by several different virtual users → a per-user CSV
+  // variable wasn't set and the plan's default was used. Only identity-like
+  // fields count (a shared class or course id is normal).
+  const userKey = (e) => `${e.agent}|${e.thread}`; // thread names repeat on every agent
+  const byKey = new Map();
+  for (const e of exs) {
+    for (const [k, v] of exParams(e)) {
+      if (flagged.has(k) || !IDENTITY_KEY.test(k) || !/^(\d{5,}|[^@\s]+@[^@\s]+\.\w+)$/.test(v)) continue;
+      if (!byKey.has(k)) byKey.set(k, new Map());
+      const m = byKey.get(k);
+      if (!m.has(v)) m.set(v, { users: new Set(), agents: new Set() });
+      m.get(v).users.add(userKey(e));
+      m.get(v).agents.add(e.agent);
+    }
+  }
+  for (const [k, m] of byKey) {
+    const [v, hit] = [...m].sort((a, b) => b[1].users.size - a[1].users.size)[0];
+    if (hit.users.size >= 3) out.push({ kind: 'same', k, v, n: hit.users.size, agents: [...hit.agents], total: new Set(exs.map(userKey)).size });
+  }
+  g._probs = out;
+  return out;
+}
+const IDENTITY_KEY = /reg|user|login|email|mobile|phone|account|student|member|customer|identifier|uid|msisdn/i;
+// A form page sent back with validation errors (ASP.NET-style
+// `field-validation-error` spans) says WHICH field the server wanted. If the
+// request never sent a field by that name, the site probably renamed it.
+function formRejections(e) {
+  const out = [];
+  for (const m of String(e.responseBody || '').matchAll(/<span\b([^>]*field-validation-error[^>]*)>([^<]+)</gi)) {
+    const f = /data-valmsg-for="([^"]+)"/i.exec(m[1]);
+    if (f && m[2].trim()) out.push({ field: f[1], msg: m[2].trim() });
+  }
+  if (!out.length) return [];
+  const sent = exParams(e).map(([k]) => k);
+  return out.map((r) => ({ ...r, missing: !sent.some((k) => k.toLowerCase() === r.field.toLowerCase()), sent }));
+}
+function formRejectionHtml(r) {
+  const sentList = r.sent.filter((k) => !/token/i.test(k)).map((k) => `<code>${esc(k)}</code>`).join(', ');
+  return r.missing
+    ? `The server rejected the form: field <code>${esc(r.field)}</code> — “${esc(r.msg)}” This request didn't send a field called <b>${esc(r.field)}</b>${sentList ? ` (it sent ${sentList})` : ''}. The site has probably renamed the field — update this request's parameter name in the plan.`
+    : `The server rejected the form: field <code>${esc(r.field)}</code> — “${esc(r.msg)}” The field was sent, so check the value it was given.`;
+}
+
+function planProblemHtml(p, total) {
+  const kv = `<code>${esc(p.k)}=${esc(p.v.length > 60 ? `${p.v.slice(0, 60)}…` : p.v)}</code>`;
+  if (p.kind === 'notfound') return `This request was sent with ${kv} — the default used when a variable is not set. The step that saves <b>${esc(p.k)}</b> may not have run for this virtual user. ${p.n} of ${total} examples look like this.`;
+  if (p.kind === 'literal') return `This request was sent with ${kv}: JMeter couldn't find that variable, so it sent its name instead of a value. ${p.n} of ${total} examples look like this.`;
+  const who = p.n === p.total ? `All ${p.n} virtual users in these examples` : `${p.n} of the ${p.total} virtual users in these examples`;
+  return `${who} sent the same ${kv} (on ${p.agents.map(esc).join(', ')}). If each user should log in with its own row from a CSV file, the CSV variable was probably not set and the plan's default value was used — check that agent's CSV file: its first line must hold the variable names (or set them in the CSV Data Set Config).`;
+}
+
+function headerLines(raw) {
+  return String(raw || '').split(/\r?\n/).map((l) => {
+    const i = l.indexOf(':');
+    return i > 0 ? [l.slice(0, i).trim(), l.slice(i + 1).trim()] : null;
+  }).filter(Boolean);
+}
+function headerValue(raw, name) {
+  const h = headerLines(raw).find(([k]) => k.toLowerCase() === name);
+  return h ? h[1] : '';
+}
+
+function tryB64Json(v) {
+  if (!v || v.length < 16 || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(v)) return null;
+  try {
+    const j = JSON.parse(atob(v.replace(/-/g, '+').replace(/_/g, '/')));
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+  } catch { return null; }
+}
+const SECRET_KEY = /pass|token|secret|auth|apikey|api_key|session|cookie|signature/i;
+
+function toCurl(e) {
+  const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const parts = [`curl -X ${(e.method || 'GET').toUpperCase()} ${q(e.url || '')}`];
+  for (const [k, v] of headerLines(e.requestHeaders)) {
+    if (/^(content-length|host|connection)$/i.test(k)) continue;
+    parts.push(`-H ${q(`${k}: ${v}`)}`);
+  }
+  if (e.cookies) parts.push(`-b ${q(e.cookies.trim())}`);
+  if (e.requestData && !isGet(e)) parts.push(`--data-raw ${q(e.requestData)}`);
+  return parts.join(' \\\n  ');
+}
+
+// Works on plain http:// too (navigator.clipboard needs a secure page).
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } finally { ta.remove(); }
+  return Promise.resolve();
+}
+
+function renderErrorsTab() {
+  const box = $('tab-errors');
+  const d = errView.d;
+  if (!d || !d.totalErrors) {
+    const n = detailState.cur && detailState.cur.overall ? detailState.cur.overall.samples : 0;
+    box.innerHTML = `<div class="empty-state"><b>No errors ${detailState.agent || detailState.tg ? 'for this filter' : 'in this run'}</b>
+      <span>Every one of the ${fmt.n(n)} requests succeeded. Failed requests would be grouped here by sampler, code and reason.</span></div>`;
+    return;
+  }
+  const groups = d.groups;
+  const labels = [...new Set(groups.map((g) => g.label))];
+  const allLabels = detailState.cur ? detailState.cur.perLabel.length : labels.length;
+  const captured = groups.reduce((a, g) => a + exTotal(g), 0);
+  const pct = (100 * d.totalErrors / Math.max(1, d.totalSamples));
+  const kpis = [
+    { k: 'Failed requests', v: fmt.n(d.totalErrors), sub: `${pct.toFixed(2)}% of ${fmt.n(d.totalSamples)} requests`, tone: 'bad' },
+    { k: 'Error types', v: fmt.n(groups.length), sub: 'Same sampler, code and reason' },
+    { k: 'Samplers affected', v: `${labels.length} of ${allLabels}`, sub: esc(labels.length === 1 ? labels[0] : `${labels[0]} and ${labels.length - 1} more`) },
+    // a stopped run can capture a few more failures than made it into the results file
+    { k: 'Examples captured', v: captured >= d.totalErrors ? 'All' : `${fmt.n(captured)} of ${fmt.n(d.totalErrors)}`, sub: 'Request and response for each' },
+  ];
+  box.innerHTML = `
+    <div class="kpi-row err-kpis">${kpis.map(kpiCard).join('')}</div>
+    ${d.captureTruncated ? `<p class="run-warn">${ic('warn')} Some capture files were too large to read completely — counts are exact, but a few examples may be missing.</p>` : ''}
+    <div class="err-layout">
+      <div class="etypes">
+        <div class="etypes-head"><b>Error types</b><span class="hint" style="margin:0">Most frequent first</span></div>
+        <div class="etype-list">${groups.map((g, i) => {
+          const why = explainAssertion(g.failure);
+          const agentsSeen = [...new Set((g.examples || []).map((e) => e.agent))];
+          const users = new Set((g.examples || []).map((e) => e.thread)).size;
+          const ms = (g.examples || []).map((e) => e.elapsed);
+          return `<button type="button" class="etype${i === errView.g ? ' on' : ''}" data-g="${i}">
+            <span class="etype-top"><span class="etype-kind">${errKind(g)}</span><span class="etype-code">${esc(g.code || '–')}${g.msg ? ` ${esc(g.msg)}` : ''}</span></span>
+            <span class="etype-name">${esc(g.label)}</span>
+            <span class="etype-desc">${esc(why ? why.short : (g.failure || g.msg || 'Failed'))}</span>
+            <span class="etype-count"><b>${fmt.n(g.count)}</b> · ${(100 * g.count / d.totalErrors).toFixed(0)}%</span>
+            <span class="etype-meta">${agentsSeen.length ? `Agent${agentsSeen.length > 1 ? 's' : ''} ${esc(agentsSeen.join(', '))} · ` : ''}${users ? `${users} user${users === 1 ? '' : 's'} · ` : ''}${new Date(g.firstTs).toLocaleTimeString('en-GB')}${g.lastTs !== g.firstTs ? `–${new Date(g.lastTs).toLocaleTimeString('en-GB')}` : ''}${ms.length ? ` · ${msHuman(Math.min(...ms))}${ms.length > 1 ? `–${msHuman(Math.max(...ms))}` : ''}` : ''}</span>
+          </button>`;
+        }).join('')}</div>
+        <p class="hint">Failures are grouped by sampler, response code and reason, with the true count. Ten thousand identical failures still show as one row, and rare ones are never hidden.</p>
+      </div>
+      <div class="exview" id="exView"></div>
+    </div>`;
+  box.querySelectorAll('.etype').forEach((b) => (b.onclick = () => {
+    errView.g = Number(b.dataset.g); errView.i = 0;
+    box.querySelectorAll('.etype').forEach((x) => x.classList.toggle('on', x === b));
+    renderErrExample();
+  }));
+  renderErrExample();
+}
+
+// Captured examples per error type can run into the thousands; the summary
+// brings the first 25 and the rest are fetched in pages as you move through them.
+const exTotal = (g) => (g.captured != null ? g.captured : (g.examples || []).length);
+async function ensureExamples(g, upto) {
+  while (g.examples.length <= upto && g.examples.length < exTotal(g)) {
+    const q = new URLSearchParams(filterQs());
+    q.set('label', g.label); q.set('code', g.code);
+    q.set('offset', String(g.examples.length));
+    q.set('limit', String(Math.min(500, Math.max(25, upto + 1 - g.examples.length))));
+    const d = await api('GET', `/api/runs/${detailState.id}/error-examples?${q}`);
+    if (!d.examples || !d.examples.length) break;
+    g.examples.push(...d.examples);
+    g._probs = null; // plan-problem checks re-run over the larger sample
+  }
+}
+
+function renderErrExample() {
+  const el = $('exView');
+  const g = errView.d.groups[errView.g];
+  const exs = g.examples || [];
+  if (!exs.length) {
+    el.innerHTML = `<div class="empty-state"><b>No captured example for this error type</b>
+      <span>The request/response capture was lost (for example, an agent's upload failed). Run the test again to capture it.</span></div>`;
+    return;
+  }
+  const total = exTotal(g);
+  errView.i = Math.min(errView.i, total - 1);
+  if (errView.i >= exs.length) { // not fetched yet
+    el.querySelector('.ex-head b') ? el.querySelector('.ex-head b').insertAdjacentHTML('beforeend', ' <span class="hint" style="margin:0">loading…</span>') : (el.innerHTML = '<p class="empty">Loading example…</p>');
+    ensureExamples(g, errView.i).catch(() => {}).then(() => {
+      if (!errView.d || errView.d.groups[errView.g] !== g || !$('exView')) return; // moved on meanwhile
+      if (errView.i >= g.examples.length) errView.i = Math.max(0, g.examples.length - 1);
+      renderErrExample();
+    });
+    return;
+  }
+  const e = exs[errView.i];
+  const why = explainAssertion(e.assertion || g.failure);
+  const probs = planProblems(g).filter((p) => p.kind === 'same' || exParams(e).some(([k, v]) => k === p.k && v === p.v));
+  const ctype = headerValue(e.responseHeaders, 'content-type');
+  const body = e.responseBody || '';
+  const isHtml = /html/i.test(ctype) || /^\s*</.test(body);
+  const respHeaders = headerLines(e.responseHeaders);
+  const reqHeaders = headerLines(e.requestHeaders);
+  const statusLine = (String(e.responseHeaders || '').split(/\r?\n/)[0] || '').trim();
+
+  // source view with the assertion's text highlighted
+  const lines = body.split(/\r?\n/).slice(0, 3000);
+  const needle = why && why.pattern;
+  let rx = null;
+  if (needle) { try { rx = new RegExp(needle); } catch { rx = null; } }
+  const hitLine = (l) => !!needle && (l.includes(needle) || (rx ? rx.test(l) : false));
+  const anyHit = lines.some(hitLine);
+
+  const qParams = (() => { try { return [...new URL(e.url).searchParams.entries()]; } catch { return []; } })();
+  const form = !isGet(e) ? parseForm(e.requestData) : null;
+  const paramRows = (list) => list.map(([k, v]) => {
+    const j = tryB64Json(v);
+    const masked = SECRET_KEY.test(k);
+    return `<tr><td class="pk">${esc(k)}</td><td class="pv">${masked ? '<span class="hint" style="margin:0">•••• hidden</span>' : esc(v) || '<span class="hint" style="margin:0">(empty)</span>'}
+      ${v === 'NOT_FOUND' ? '<div class="pwarn">Not a real value — the variable was most likely never set.</div>' : ''}
+      ${j ? `<details class="b64"><summary>Decoded from Base64 JSON · secrets hidden</summary><table class="ptable">${Object.entries(j).map(([jk, jv]) =>
+        `<tr><td class="pk">${esc(jk)}</td><td class="pv">${SECRET_KEY.test(jk) ? '•••• hidden' : esc(typeof jv === 'object' ? JSON.stringify(jv) : String(jv))}</td></tr>`).join('')}</table></details>` : ''}</td></tr>`;
+  }).join('');
+
+  el.innerHTML = `
+    <div class="ex-head">
+      <span class="ex-nav">
+        <button type="button" class="ghost mini" id="exPrev" aria-label="Previous example" ${total < 2 ? 'disabled' : ''}>‹</button>
+        <b>Example <input type="number" class="ex-jump" id="exJump" min="1" max="${total}" value="${errView.i + 1}" aria-label="Example number, 1 to ${total}"> of ${fmt.n(total)}</b>
+        <button type="button" class="ghost mini" id="exNext" aria-label="Next example" ${total < 2 ? 'disabled' : ''}>›</button>
+        ${g.count > total ? `<span class="hint" style="margin:0">(${fmt.n(g.count)} failed; ${fmt.n(total)} captured)</span>` : ''}
+      </span>
+      <span class="ex-tools">
+        <button type="button" class="ghost mini" id="exCurl">Copy as cURL</button>
+        <button type="button" class="ghost mini" id="exAll">Download all ${fmt.n(total)}</button>
+      </span>
+    </div>
+    <div class="ex-chips">
+      <span class="ex-chip">Agent <b>${esc(e.agent)}</b></span>
+      <span class="ex-chip">Virtual user <b>${esc(e.thread || '–')}</b></span>
+      <span class="ex-chip">Started <b>${new Date(e.t).toLocaleTimeString('en-GB')}</b></span>
+      <span class="ex-chip">Response time <b>${fmt.ms(e.elapsed)}</b></span>
+      ${e.bytes ? `<span class="ex-chip">Size <b>${fmt.n(e.bytes)} bytes</b></span>` : ''}
+    </div>
+    ${probs.map((p) => `<div class="plan-warn">${ic('warn')}<span><b>Possible plan problem:</b> ${planProblemHtml(p, exs.length)}</span></div>`).join('')}
+    ${formRejections(e).map((r) => `<div class="plan-warn">${ic('warn')}<span><b>${r.missing ? 'Possible plan problem:' : 'Form rejected:'}</b> ${formRejectionHtml(r)}</span></div>`).join('')}
+    <div class="why">
+      <h3>Why it failed</h3>
+      ${why ? `<p>${esc(why.text)}</p><pre class="why-pat">${esc(why.pattern)}</pre>` : `<p>The server answered <b>${esc(e.code)} ${esc(e.msg)}</b>${/^\d{3}$/.test(String(e.code)) ? '' : ' — the request did not get a normal HTTP response'}.</p>`}
+      ${e.assertion || g.failure ? `<p class="why-raw">JMeter message: ${esc(e.assertion || g.failure)}</p>` : ''}
+    </div>
+    <div class="tabbar ex-tabs" role="tablist">
+      <button type="button" role="tab" data-side="resp" class="${errView.side === 'resp' ? 'on' : ''}" aria-selected="${errView.side === 'resp'}">Response</button>
+      <button type="button" role="tab" data-side="req" class="${errView.side === 'req' ? 'on' : ''}" aria-selected="${errView.side === 'req'}">Request</button>
+    </div>
+    ${errView.side === 'resp' ? `
+    <div class="ex-pane">
+      <div class="ex-status"><span class="err-code">${esc(statusLine || `${e.code} ${e.msg}`)}</span>${ctype ? `<span class="hint" style="margin:0">${esc(ctype)}</span>` : ''}
+        ${body && isHtml ? `<span class="seg ex-seg"><button type="button" data-body="source" class="${errView.body === 'source' ? 'active' : ''}">Source</button><button type="button" data-body="preview" class="${errView.body === 'preview' ? 'active' : ''}">Preview</button></span>` : ''}</div>
+      ${!body ? '<p class="hint">The response had no body.</p>'
+        : isHtml && errView.body === 'preview'
+          ? `<iframe class="ex-preview" sandbox="" title="Response preview" srcdoc="${esc(previewDoc(body))}"></iframe>
+             <p class="hint">Rendered safely in a sandbox · scripts and images from the target are blocked.</p>`
+          : `<ol class="ex-src">${lines.map((l) => `<li${hitLine(l) ? ' class="hit"' : ''}><code>${esc(l) || ' '}</code></li>`).join('')}</ol>
+             ${anyHit ? '<p class="hint">Highlighted: the line that matched the assertion.</p>' : ''}`}
+      ${respHeaders.length ? `<details class="ex-det"><summary>Response headers <span class="count-pill">${respHeaders.length}</span></summary>
+        <table class="ptable">${respHeaders.map(([k, v]) => `<tr><td class="pk">${esc(k)}</td><td class="pv">${esc(v)}</td></tr>`).join('')}</table></details>` : ''}
+    </div>` : `
+    <div class="ex-pane">
+      <div class="req-line"><span class="req-method">${esc((e.method || 'GET').toUpperCase())}</span><span class="req-url">${esc(e.url || '(URL not captured)')}</span></div>
+      ${qParams.length ? `<h4>Query parameters</h4><table class="ptable">${paramRows(qParams)}</table>` : ''}
+      ${!isGet(e) ? (form ? `<h4>Form fields</h4><table class="ptable">${paramRows(form)}</table>`
+        : e.requestData ? `<h4>Request body</h4><pre class="resp-body">${esc(e.requestData)}</pre>` : '<p class="hint">Request body: none.</p>') : ''}
+      ${reqHeaders.length ? `<details class="ex-det"><summary>Request headers <span class="count-pill">${reqHeaders.length}</span></summary>
+        <table class="ptable">${reqHeaders.map(([k, v]) => `<tr><td class="pk">${esc(k)}</td><td class="pv">${esc(v)}</td></tr>`).join('')}</table></details>` : ''}
+      ${(() => {
+        const cookies = String(e.cookies || '').split(/;\s*/).map((c) => c.trim()).filter(Boolean)
+          .map((c) => { const i = c.indexOf('='); return i > 0 ? [c.slice(0, i), c.slice(i + 1)] : [c, '']; });
+        return cookies.length
+          ? `<details class="ex-det"><summary>Cookies sent <span class="count-pill">${cookies.length}</span></summary>
+              <table class="ptable">${cookies.map(([k, v]) => `<tr><td class="pk">${esc(k)}</td><td class="pv">${esc(v)}</td></tr>`).join('')}</table></details>`
+          : '<p class="hint">Cookies sent: none.</p>';
+      })()}
+      ${isGet(e) ? '<p class="hint">Request body: none (GET).</p>' : ''}
+    </div>`}`;
+
+  const go = (d) => { errView.i = (errView.i + d + total) % total; renderErrExample(); };
+  $('exJump').onchange = () => {
+    const n = Math.round(Number($('exJump').value));
+    errView.i = Math.min(total, Math.max(1, Number.isFinite(n) ? n : 1)) - 1;
+    renderErrExample();
+  };
+  $('exPrev').onclick = () => go(-1);
+  $('exNext').onclick = () => go(1);
+  el.querySelectorAll('[data-side]').forEach((b) => (b.onclick = () => { errView.side = b.dataset.side; renderErrExample(); }));
+  el.querySelectorAll('[data-body]').forEach((b) => (b.onclick = () => { errView.body = b.dataset.body; renderErrExample(); }));
+  $('exCurl').onclick = () => copyText(toCurl(e)).then(() => flash($('exCurl'), 'Copied ✓')).catch(() => alert(toCurl(e)));
+  $('exAll').onclick = async () => {
+    const btn = $('exAll');
+    btn.disabled = true; btn.textContent = 'Preparing…';
+    try { await ensureExamples(g, total - 1); } catch (err) { alert(`Could not fetch every example: ${err.message}`); }
+    btn.disabled = false; btn.textContent = `Download all ${fmt.n(total)}`;
+    const blob = new Blob([JSON.stringify(g.examples, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `errors-${(g.label || 'sampler').replace(/[^\w.-]+/g, '_')}-${g.code || 'x'}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  };
+}
+
 
 // ---------------- report: run-page section ----------------
 
@@ -2927,7 +4173,15 @@ function printReport() {
   const r = reportState.current;
   if (!r) return;
   const activeBefore = reportState.activeSheet;
-  const sheetTable = (sheet) => { reportState.activeSheet = sheet; renderReport(); return $('reportGrid').innerHTML.replace(/<input[^>]*value="([^"]*)"[^>]*>/g, '$1').replace(/<button[^>]*>.*?<\/button>/g, '').replace(/<span class="col-del"[^>]*>.*?<\/span>/g, ''); };
+  // inputs become plain text nodes (escaped on serialising — an attribute value
+  // keeps its < and > raw, so copying it out as HTML would run typed-in markup)
+  const sheetTable = (sheet) => {
+    reportState.activeSheet = sheet; renderReport();
+    const grid = $('reportGrid').cloneNode(true);
+    grid.querySelectorAll('input').forEach((i) => i.replaceWith(document.createTextNode(i.value)));
+    grid.querySelectorAll('button, .col-del').forEach((b) => b.remove());
+    return grid.innerHTML;
+  };
   const parts = [`<h2>Main Report</h2>${sheetTable('main')}`];
   for (const p of r.people) parts.push(`<h2>${esc(p.name)}</h2>${sheetTable(p.id)}`);
   reportState.activeSheet = activeBefore; renderReport();
@@ -3067,6 +4321,8 @@ function parseHMS(v) {
 // saturated, so its response times reflect the agent PC, not the target.
 function resMeterInner(res) {
   if (!res || res.cpu == null) return '<span class="hint" style="margin:0">—</span>';
+  const pct = (v) => Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
+  res = { cpu: pct(res.cpu), mem: pct(res.mem), memUsedGB: Number(res.memUsedGB) || 0, memTotalGB: Number(res.memTotalGB) || 0 };
   const lvl = (v) => (v >= 90 ? 'crit' : v >= 75 ? 'warn' : 'ok');
   const one = (k, v, title) => `<span class="resm-item ${lvl(v)}" title="${title}"><span class="resm-k">${k}</span><span class="resm-bar"><span style="width:${v}%"></span></span><span class="resm-v">${v}%</span></span>`;
   return `${one('CPU', res.cpu, `CPU ${res.cpu}%`)}${one('RAM', res.mem, `RAM ${res.memUsedGB} / ${res.memTotalGB} GB`)}`;
@@ -3083,44 +4339,284 @@ function updateResMeters() {
   });
 }
 
-function renderAgents() {
-  $('agentEmpty').style.display = state.agents.length ? 'none' : 'block';
-  $('agentRows').innerHTML = state.agents.map((a) => `
-    <tr>
-      <td><b>${esc(a.name)}</b>${a.stub ? ' <span class="chip">STUB</span>' : ''}</td>
-      <td>${esc(a.address || '')}</td>
-      <td class="num">${a.cpus}</td>
-      <td class="num">${a.memGB} GB</td>
-      <td>${resMeter(a.res, a.name)}</td>
-      <td>${a.jmeterReady ? 'ready' : 'will bootstrap'}</td>
-      <td><span class="state ${a.state === 'running' ? 'running' : ''}">${a.state}</span></td>
-      <td><button class="ghost mini row-del" title="Stop this agent (its process exits; reinstall/restart it on that PC to bring it back)"
-        onclick="stopAgent('${esc(a.name)}')">✕ Stop</button></td>
-    </tr>`).join('');
+// ---------------- Agents & teams page ----------------
+
+const fleetSel = new Set(); // agent names ticked in the Agents tab
+
+async function loadFleet() {
+  try { state.teams = await api('GET', '/api/teams'); } catch { /* keep */ }
+  renderAgents();
+  $('fleetCtrlUrl').textContent = await controllerUrl();
+  if ($('fleet-teams').classList.contains('active')) loadTeamView();
+  if ($('fleet-network').classList.contains('active')) loadAgentDir();
 }
 
-window.stopAgent = async (name) => {
-  if (!confirm(`Stop agent "${name}"?\nIts process will exit on that PC. Start it again there (or via its Startup shortcut at next login) to bring it back.`)) return;
-  try { await api('POST', `/api/agents/${encodeURIComponent(name)}/shutdown`); }
-  catch (e) { alert(`Failed: ${e.message}`); }
+function fleetTab(name) {
+  document.querySelectorAll('#view-fleet .tabbar [data-ftab]').forEach((b) => {
+    const on = b.dataset.ftab === name;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  ['agents', 'teams', 'network'].forEach((t) => $(`fleet-${t}`).classList.toggle('active', t === name));
+  if (name === 'teams') loadTeamView();
+  if (name === 'network') loadAgentDir();
+}
+document.querySelectorAll('#view-fleet .tabbar [data-ftab]').forEach((b) => (b.onclick = () => fleetTab(b.dataset.ftab)));
+$('fleetAddBtn').onclick = () => {
+  const box = $('fleetAddBox');
+  box.hidden = !box.hidden;
+  $('fleetAddBtn').setAttribute('aria-expanded', String(!box.hidden));
 };
+
+function agentStatusBadge(a) {
+  if (a.state === 'idle') return '<span class="rbadge ok">Idle</span>';
+  if (a.state === 'running' || a.state === 'preparing') return '<span class="rbadge live">Running a test</span>';
+  return `<span class="rbadge neutral">${esc(a.state || 'Unknown')}</span>`;
+}
+
+function renderAgents() {
+  const agents = state.agents || [];
+  const teamsOf = (name) => (state.teams || []).filter((t) => t.agents.includes(name)).map((t) => t.name);
+  [...fleetSel].forEach((n) => { if (!agents.some((a) => a.name === n)) fleetSel.delete(n); });
+  $('agentEmpty').hidden = agents.length > 0;
+  $('agentRows').innerHTML = agents.map((a) => `
+    <tr${fleetSel.has(a.name) ? ' class="sel"' : ''}>
+      <td class="sel-col"><input type="checkbox" class="fleetCb" value="${esc(a.name)}" ${fleetSel.has(a.name) ? 'checked' : ''} aria-label="Select ${esc(a.name)}"></td>
+      <td><b>${esc(a.name)}</b>${a.stub ? ' <span class="rbadge neutral">Test stub</span>' : ''}</td>
+      <td class="mono-cell">${esc(a.address || '–')}</td>
+      <td>${agentStatusBadge(a)}</td>
+      <td class="nowrap">${Number(a.cpus) || 0} cores · ${Number(a.memGB) || 0} GB</td>
+      <td>${resMeter(a.res, a.name)}</td>
+      <td>${a.jmeterReady ? 'Ready' : '<span class="hint" style="margin:0">Downloads on first run</span>'}</td>
+      <td>${teamsOf(a.name).map((t) => `<span class="team-chip">${esc(t)}</span>`).join(' ') || '<span class="hint" style="margin:0">—</span>'}</td>
+      <td><button type="button" class="ghost mini agent-stop" data-name="${esc(a.name)}" title="Stops the agent program on that PC. Start it there again (or restart the PC) to bring it back.">Stop agent</button></td>
+    </tr>`).join('');
+  $('agentRows').querySelectorAll('.fleetCb').forEach((cb) => (cb.onchange = () => {
+    if (cb.checked) fleetSel.add(cb.value); else fleetSel.delete(cb.value);
+    cb.closest('tr').classList.toggle('sel', cb.checked);
+    updateFleetBulk();
+  }));
+  $('agentRows').querySelectorAll('.agent-stop').forEach((b) => (b.onclick = () => stopAgent(b.dataset.name)));
+
+  const busy = agents.filter((a) => a.state !== 'idle').length;
+  const pcs = new Set(agents.map((a) => a.address).filter(Boolean)).size;
+  $('fleetStats').innerHTML = `
+    <span class="fstat"><b>${agents.length}</b> online</span>
+    <span class="fstat"><b>${busy}</b> running a test</span>
+    <span class="fstat"><b>${pcs}</b> PC${pcs === 1 ? '' : 's'}</span>`;
+  $('ftabAgents').textContent = `Agents · ${agents.length}`;
+  $('ftabTeams').textContent = `Teams · ${(state.teams || []).length}`;
+  updateFleetBulk();
+}
+
+function updateFleetBulk() {
+  const n = fleetSel.size;
+  const all = (state.agents || []).length;
+  $('fleetBulk').hidden = n === 0;
+  $('fleetSelAll').checked = all > 0 && n === all;
+  $('fleetSelCount').innerHTML = `<b>${n}</b> selected`;
+  const cur = $('fleetTeamPick').value;
+  $('fleetTeamPick').innerHTML = (state.teams || []).map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('') +
+    '<option value="__new">New team…</option>';
+  if ([...$('fleetTeamPick').options].some((o) => o.value === cur)) $('fleetTeamPick').value = cur;
+}
+$('fleetSelAll').onchange = () => {
+  fleetSel.clear();
+  if ($('fleetSelAll').checked) (state.agents || []).forEach((a) => fleetSel.add(a.name));
+  renderAgents();
+};
+$('fleetClearSel').onclick = () => { fleetSel.clear(); renderAgents(); };
+$('fleetAddToTeam').onclick = async () => {
+  const names = [...fleetSel];
+  if (!names.length) return;
+  const pick = $('fleetTeamPick').value;
+  try {
+    let team;
+    if (pick === '__new') {
+      const name = (prompt('Name for the new team:') || '').trim();
+      if (!name) return;
+      team = await api('POST', '/api/teams', { name, agents: names });
+      state.teams.push(team);
+    } else {
+      const t = state.teams.find((x) => x.id === pick);
+      if (!t) return;
+      team = await api('PUT', `/api/teams/${t.id}`, { name: t.name, agents: [...new Set([...t.agents, ...names])] });
+      state.teams[state.teams.findIndex((x) => x.id === t.id)] = team;
+    }
+    $('fleetBulkMsg').textContent = `✓ Added ${names.length} agent${names.length === 1 ? '' : 's'} to “${team.name}”`;
+    setTimeout(() => { $('fleetBulkMsg').textContent = ''; }, 3000);
+    fleetSel.clear();
+    renderAgents();
+    populateTeamSelect();
+    if ($('fleet-teams').classList.contains('active')) { renderTeamForm(); renderTeamList(); }
+  } catch (e) { $('fleetBulkMsg').textContent = `✗ ${e.message}`; }
+};
+
+async function stopAgent(name) {
+  if (!confirm(`Stop agent "${name}"?\nIts program exits on that PC. Start it there again (or restart the PC) to bring it back.`)) return;
+  try { await api('POST', `/api/agents/${encodeURIComponent(name)}/shutdown`); } catch (e) { alert(`Failed: ${e.message}`); }
+}
+
+// "Use in a new run": tick exactly this team's agents in step 3.
+function useTeamInNewRun(team) {
+  state.agentChoice = new Set(team.agents);
+  if (state.plan) renderAgentPick();
+  showView('new');
+  if (state.plan) {
+    wizGo(3);
+    if ($('loadTeamSel')) $('loadTeamSel').value = team.id;
+    $('teamLoadNote').textContent = `✓ loaded "${team.name}"`;
+  } else {
+    $('wizHint').textContent = `Team “${team.name}” will be selected in step 3 — choose a plan first.`;
+  }
+}
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// ---------------- Home: is the lab ready, what ran recently, how is the fleet ----------------
+
+const homeState = { runs: [] };
+
+function agoText(iso) {
+  if (!iso) return '';
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} minute${m === 1 ? '' : 's'} ago`;
+  const hr = Math.round(m / 60);
+  if (hr < 24) return `${hr} hour${hr === 1 ? '' : 's'} ago`;
+  const d = Math.round(hr / 24);
+  return d === 1 ? 'yesterday' : `${d} days ago`;
+}
+function dayWord(iso) {
+  const d = new Date(iso), today = new Date();
+  const y = new Date(); y.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return 'Today';
+  if (d.toDateString() === y.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+}
+
+async function loadHome() {
+  await ensureSla();
+  if (!state.agents.length) { try { state.agents = await api('GET', '/api/agents'); } catch { /* not up yet */ } }
+  try { homeState.runs = await api('GET', '/api/runs'); } catch { /* keep the last list */ }
+  renderHome();
+}
+
+function renderHome() {
+  const runs = homeState.runs || [];
+  const agents = state.agents || [];
+  const active = (state.run && isActiveRun(state.run)) ? state.run : runs.find(isActiveRun);
+  const last = runs.find((r) => isEndedRun(r) && r.overall);
+  const idle = agents.filter((a) => a.state === 'idle').length;
+  const busy = agents.length - idle;
+
+  // ---- status banner ----
+  let title, text, actions;
+  if (active) {
+    title = 'A test is running';
+    text = `${esc(active.planName || 'A run')} started ${agoText(active.createdAt)} on ${(active.agents || []).length} agent${(active.agents || []).length === 1 ? '' : 's'}.`;
+    actions = '<button type="button" class="primary" id="homeLive">Open live monitor</button>';
+  } else if (!agents.length) {
+    title = 'No agents connected';
+    text = 'Install the agent on a worker PC, or bring existing agents to this controller.';
+    actions = '<button type="button" class="primary" id="homeFleetBtn">Add an agent PC</button>';
+  } else {
+    const v = last ? slaVerdict(last) : null;
+    title = idle ? 'Ready to run' : 'Every agent is busy';
+    text = `${idle === agents.length ? `All ${agents.length} agent${agents.length === 1 ? ' is' : 's are'} online and idle.` : `${idle} of ${agents.length} agents are idle.`}` +
+      (last ? ` The last run finished ${agoText(last.endedAt || last.createdAt)}${v === 'pass' ? ' and passed its SLA' : v === 'fail' ? ' and failed its SLA' : ''}.` : '');
+    actions = `${last && last.planId ? '<button type="button" class="ghost" id="homeRepeat">Repeat last run</button>' : ''}
+      <button type="button" class="primary" id="homeNew">New run</button>`;
+  }
+  const tone = active ? 'live' : !agents.length ? 'warn' : idle ? 'ok' : 'live';
+  $('homeBanner').className = `card home-banner ${tone}`;
+  $('homeBanner').innerHTML = `<span class="hb-dot" aria-hidden="true"></span>
+    <div class="hb-text"><h2>${title}</h2><p>${text}</p></div>
+    <div class="hb-actions">${actions}</div>`;
+  if ($('homeLive')) $('homeLive').onclick = () => showView('live');
+  if ($('homeFleetBtn')) $('homeFleetBtn').onclick = () => { showView('fleet'); $('fleetAddBox').hidden = false; };
+  if ($('homeNew')) $('homeNew').onclick = () => showView('new');
+  if ($('homeRepeat')) $('homeRepeat').onclick = () => runAgain(last, $('homeRepeat'));
+
+  // ---- KPI tiles ----
+  const today = new Date().toDateString();
+  const todays = runs.filter((r) => new Date(r.createdAt).toDateString() === today);
+  const passT = todays.filter((r) => runResult(r) === 'pass').length;
+  const failT = todays.filter((r) => runResult(r) === 'fail').length;
+  const otherT = todays.length - passT - failT;
+  const lo = last && last.overall;
+  const lv = last ? slaVerdict(last) : null;
+  const maxErr = slaThresholds && slaThresholds.maxErrorPct;
+  $('homeKpis').innerHTML = [
+    { k: 'Agents online', v: fmt.n(agents.length), sub: !agents.length ? 'None connected' : busy ? `${busy} running a test` : 'All idle' },
+    { k: 'Runs today', v: fmt.n(todays.length), sub: todays.length ? [passT && `${passT} passed`, failT && `${failT} failed SLA`, otherT && `${otherT} other`].filter(Boolean).join(' · ') : 'None yet' },
+    { k: 'Last run throughput', v: lo ? `${lo.throughput} req/s` : '–', sub: lo ? `${fmt.n(lo.samples)} requests in ${durHuman(last.durationSec)}` : '' },
+    { k: 'Last run error rate', v: lo ? `${lo.errorPct}%` : '–', tone: lv === 'fail' ? 'bad' : '',
+      sub: lo ? `${fmt.n(lo.errors)} error${lo.errors === 1 ? '' : 's'}${maxErr != null ? ` · ${lo.errorPct <= maxErr ? 'inside' : 'over'} the ${maxErr}% SLA` : ''}` : '' },
+  ].map(kpiCard).join('');
+
+  // ---- recent runs ----
+  const recent = runs.slice(0, 6);
+  $('homeRunsEmpty').hidden = recent.length > 0;
+  $('homeRuns').innerHTML = recent.map((r) => {
+    const o = r.overall;
+    const users = runVUsers(r);
+    const target = (r.targets || [])[0];
+    return `<tr data-id="${esc(r.id)}">
+      <td class="run-time"><b>${new Date(r.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</b><span class="run-target" style="font-family:inherit">${dayWord(r.createdAt)}</span></td>
+      <td><a class="run-link" href="#run/${encodeURIComponent(r.id)}">${esc(r.planName || r.id)}</a>${target ? `<span class="run-target">${esc(target)}</span>` : ''}</td>
+      <td>${resultBadge(r)}</td>
+      <td class="num">${users != null ? fmt.n(users) : '–'}</td>
+      <td class="num">${o ? o.throughput : '–'}</td>
+      <td class="num${o && o.errorPct > 0 ? ' err-txt' : ''}">${o ? `${o.errorPct}%` : '–'}</td>
+    </tr>`;
+  }).join('');
+  $('homeRuns').querySelectorAll('tr[data-id]').forEach((tr) => (tr.onclick = (e) => {
+    if (e.target.closest('a') && (e.ctrlKey || e.metaKey || e.shiftKey)) return;
+    e.preventDefault();
+    openRun(tr.dataset.id);
+  }));
+
+  // ---- fleet health: one row per PC ----
+  const byPc = new Map();
+  for (const a of agents) {
+    const k = a.address || a.name;
+    if (!byPc.has(k)) byPc.set(k, []);
+    byPc.get(k).push(a);
+  }
+  $('homeFleet').innerHTML = byPc.size ? [...byPc].map(([ip, list]) => {
+    const base = list.map((a) => a.name.replace(/[-_ ]?\d+$/, '')).sort((x, y) => x.length - y.length)[0] || list[0].name;
+    const running = list.some((a) => a.state !== 'idle');
+    return `<div class="pc-row">
+      <div class="pc-main"><b>${esc(base)} PC</b> <span class="hint" style="margin:0">${list.length} agent${list.length === 1 ? '' : 's'}</span>
+        <div class="pc-sub"><span class="mono">${esc(ip)}</span> · ${running ? '<span class="pc-busy">Running a test</span>' : 'Idle'}</div></div>
+      <div class="pc-res">${resMeter(list[0].res, list[0].name)}</div>
+    </div>`;
+  }).join('') : '<div class="empty-state"><b>No agents connected</b><span>Agents appear here as soon as they connect.</span></div>';
+}
+
 // ---------------- boot: restore state on page load ----------------
+
+// A reload / bookmark / link (#runs, #run/<id>…) opens that page straight away.
+const startHash = location.hash.slice(1);
+if (startHash) routeFromHash();
+else showView('home', { replace: true });
 
 (async () => {
   try {
     state.agents = await api('GET', '/api/agents');
     renderAgents();
+    try { state.teams = await api('GET', '/api/teams'); populateTeamSelect(); } catch { /* teams optional */ }
     state.library = (await api('GET', '/api/library')).files || [];
+    await ensureSla(); // result badges (Passed / Failed SLA) need the limits
     const runs = await api('GET', '/api/runs');
     const active = runs.find((r) => r.state === 'running' || r.state === 'finalizing');
     if (active) {
       onRunUpdate(active);
-      showView('live');
+      if (!startHash) showView('live', { replace: true });
     } else if (runs.length) {
       // Live tab shows the most recent run's results instead of an empty page.
       onRunUpdate(runs[0]);

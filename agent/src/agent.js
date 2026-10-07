@@ -31,6 +31,11 @@ const CONFIG_FILE = path.join(BASE_DIR, 'config.json');
 const RUNTIME_DIR = path.join(BASE_DIR, 'runtime');
 const WORK_DIR = path.join(BASE_DIR, 'work');
 const LOG_FILE = path.join(BASE_DIR, 'agent.log');
+// The controller address on the command line (what the startup task was installed with).
+const INSTALL_URL = (() => {
+  const a = process.argv.find((x) => /^https?:\/\//.test(x));
+  return a ? a.trim().replace(/\/+$/, '') : null;
+})();
 
 // Tee console output to agent.log so there's a record even when the agent runs
 // windowless (no console) as a background app. Keeps the last ~1MB.
@@ -65,8 +70,13 @@ function promptForController() {
 async function loadConfig() {
   let cfg = {};
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { /* first run */ }
-  const argUrl = process.argv.find((a) => /^https?:\/\//.test(a));
-  if (argUrl) cfg.controller = argUrl.replace(/\/+$/, '');
+  if (INSTALL_URL) {
+    // The startup task passes the install-time controller on every boot. If a
+    // controller has since claimed this agent (redirect), keep following THAT
+    // one; the install-time address wins again only when it changes (reinstall).
+    const keepRedirect = cfg.redirect && cfg.redirect.from === INSTALL_URL && cfg.controller;
+    if (!keepRedirect) { cfg.controller = INSTALL_URL; delete cfg.redirect; }
+  }
   if (process.argv.includes('--stub')) cfg.stub = true;
   if (process.argv.includes('--no-stub')) cfg.stub = false;
   const nameArg = process.argv.indexOf('--name');
@@ -117,14 +127,42 @@ function httpMod(url) {
   return url.startsWith('https') ? https : http;
 }
 
-function download(url, dest) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Download to `dest`. Rejects (and deletes the partial file) on a non-200, a
+ * dropped connection, a short body or a stall — a half-downloaded plan, data
+ * file or JMeter zip must never be used, and a dead link must not hang a run.
+ */
+function download(url, dest, idleMs = 60000) {
   return new Promise((resolve, reject) => {
+    let settled = false;
     const file = fs.createWriteStream(dest);
-    httpMod(url).get(url, (res) => {
-      if (res.statusCode !== 200) return reject(new Error(`GET ${url} -> ${res.statusCode}`));
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      try { file.destroy(); } catch { /* ignore */ }
+      fs.unlink(dest, () => {});
+      reject(e);
+    };
+    const req = httpMod(url).get(url, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return fail(new Error(`GET ${url} -> ${res.statusCode}`)); }
+      const expected = parseInt(res.headers['content-length'], 10);
+      let got = 0;
+      res.on('data', (d) => { got += d.length; });
+      res.on('error', fail);
+      res.on('close', () => { if (!res.complete) fail(new Error(`download of ${url} was cut off after ${got} bytes`)); });
+      file.on('finish', () => file.close(() => {
+        if (settled) return;
+        if (Number.isFinite(expected) && got !== expected) return fail(new Error(`download of ${url} incomplete (${got} of ${expected} bytes)`));
+        settled = true;
+        resolve();
+      }));
       res.pipe(file);
-      file.on('finish', () => file.close(resolve));
-    }).on('error', reject);
+    });
+    req.on('error', fail);
+    req.setTimeout(idleMs, () => req.destroy(new Error(`download of ${url} stalled (no data for ${idleMs / 1000}s)`)));
+    file.on('error', fail);
   });
 }
 
@@ -138,7 +176,8 @@ function uploadFileOnce(url, filePath) {
       res.statusCode === 200 ? resolve() : reject(new Error(`upload -> ${res.statusCode}`));
     });
     req.on('error', reject);
-    fs.createReadStream(filePath).pipe(req);
+    req.setTimeout(120000, () => req.destroy(new Error('upload stalled (no progress for 120s)')));
+    fs.createReadStream(filePath).on('error', (e) => req.destroy(e)).pipe(req);
   });
 }
 
@@ -153,6 +192,23 @@ async function uploadFile(url, filePath, attempts = 4) {
     }
   }
   throw lastErr;
+}
+
+/** Fetch small JSON from the controller (used for the bundle version check). Null on any error. */
+function getJson(url, timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    try {
+      const req = httpMod(url).get(url, (res) => {
+        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+        let body = '';
+        res.on('data', (d) => { body += d; });
+        res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
+        res.on('error', () => resolve(null));
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(timeoutMs, () => { req.destroy(); resolve(null); });
+    } catch { resolve(null); }
+  });
 }
 
 // ---------- jmeter / java discovery & bootstrap ----------
@@ -194,41 +250,98 @@ function extractZip(zip, dest) {
   });
 }
 
+/**
+ * Download a bundle zip and unpack it into the runtime folder WITHOUT ever
+ * leaving a half-extracted copy there: extract into a private temp folder,
+ * then move the finished folder(s) in. (A cut-short extract straight into
+ * runtime/ could leave jmeter.bat behind and be taken for a good install.)
+ */
+async function installBundle(name, report) {
+  const tmpZip = path.join(RUNTIME_DIR, `.${name}-${process.pid}.zip`);
+  const tmpDir = path.join(RUNTIME_DIR, `.extract-${name}-${process.pid}`);
+  try {
+    await download(`${config.controller}/bundle/${name}.zip`, tmpZip);
+    report(`extracting ${name}...`);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    await extractZip(tmpZip, tmpDir);
+    for (const d of fs.readdirSync(tmpDir)) {
+      const to = path.join(RUNTIME_DIR, d);
+      if (!fs.existsSync(to)) fs.renameSync(path.join(tmpDir, d), to);
+    }
+  } finally {
+    fs.rmSync(tmpZip, { force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Several agents on one PC share runtime/. Only one may install or upgrade the
+ * bundle at a time; the others wait, then re-check (it is usually done by then).
+ */
+async function withRuntimeLock(report, fn) {
+  const lock = path.join(RUNTIME_DIR, '.bundle.lock');
+  for (let i = 0; ; i++) {
+    try { fs.writeFileSync(lock, String(process.pid), { flag: 'wx' }); break; } catch {
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > 15 * 60000) { fs.rmSync(lock, { force: true }); continue; } } catch { continue; }
+      if (i === 0) report('another agent on this PC is installing JMeter — waiting for it...');
+      await sleep(2000);
+    }
+  }
+  try { return await fn(); } finally { fs.rmSync(lock, { force: true }); }
+}
+
 /** Make sure JMeter (and a usable java) exist; download bundles from the controller if not. */
 async function ensureJmeter(report) {
   fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 
-  if (!findJmeterBat()) {
-    report('downloading JMeter bundle from controller...');
-    const zip = path.join(RUNTIME_DIR, 'jmeter.zip');
-    await download(`${config.controller}/bundle/jmeter.zip`, zip);
-    report('extracting JMeter...');
-    await extractZip(zip, RUNTIME_DIR);
-    fs.unlinkSync(zip);
-  }
+  // Auto-upgrade: compare our extracted bundle fingerprint to the controller's.
+  // If it changed (a newer JMeter was dropped on the controller), re-download.
+  const marker = path.join(RUNTIME_DIR, '.jmeter-bundle-version');
+  const readMarker = () => { try { return fs.readFileSync(marker, 'utf8').trim(); } catch { return null; } };
+  const meta = await getJson(`${config.controller}/bundle/meta`);
+  const wantVer = meta && meta.jmeter ? String(meta.jmeter) : null;
+  const jarOk = () => { const b = findJmeterBat(); return !!b && fs.existsSync(path.join(path.dirname(b), 'ApacheJMeter.jar')); };
+
+  await withRuntimeLock(report, async () => {
+    const haveVer = readMarker();
+    let needDownload = false, upgrading = false;
+    if (!jarOk()) needDownload = true;
+    else if (wantVer && haveVer && haveVer !== wantVer) { needDownload = true; upgrading = true; }
+    else if (wantVer && !haveVer) { try { fs.writeFileSync(marker, wantVer); } catch { /* adopt existing as current */ } }
+    if (!needDownload) return;
+    report(upgrading ? `JMeter bundle changed on controller — upgrading (was ${haveVer}, now ${wantVer})` : 'downloading JMeter bundle from controller...');
+    for (const d of fs.readdirSync(RUNTIME_DIR)) {
+      if (d.toLowerCase().startsWith('apache-jmeter')) { try { fs.rmSync(path.join(RUNTIME_DIR, d), { recursive: true, force: true }); } catch { /* ignore */ } }
+    }
+    try { fs.rmSync(marker, { force: true }); } catch { /* ignore */ }
+    await installBundle('jmeter', report);
+    if (!jarOk()) throw new Error('the JMeter bundle from the controller did not contain a usable JMeter');
+    if (wantVer) { try { fs.writeFileSync(marker, wantVer); } catch { /* ignore */ } }
+  });
 
   const env = { ...process.env };
+  let bundledJava = null;
   if (!systemJavaWorks()) {
     if (!findBundledJava()) {
-      report('java not found — downloading JRE bundle from controller...');
-      const zip = path.join(RUNTIME_DIR, 'jre.zip');
-      await download(`${config.controller}/bundle/jre.zip`, zip);
-      report('extracting JRE...');
-      await extractZip(zip, RUNTIME_DIR);
-      fs.unlinkSync(zip);
+      await withRuntimeLock(report, async () => {
+        if (findBundledJava()) return; // another agent on this PC just installed it
+        report('java not found — downloading JRE bundle from controller...');
+        await installBundle('jre', report);
+      });
     }
-    const java = findBundledJava();
-    if (!java) throw new Error('no usable java (system java missing and no JRE bundle on controller)');
-    env.JAVA_HOME = path.dirname(path.dirname(java));
-    env.PATH = `${path.dirname(java)};${env.PATH}`;
+    bundledJava = findBundledJava();
+    if (!bundledJava) throw new Error('no usable java (system java missing and no JRE bundle on controller)');
+    env.JAVA_HOME = path.dirname(path.dirname(bundledJava));
+    env.PATH = `${path.dirname(bundledJava)};${env.PATH}`;
   }
 
   const bat = findJmeterBat();
   if (!bat) throw new Error('JMeter not available (not installed and no bundle on controller at /bundle/jmeter.zip)');
   const home = path.dirname(path.dirname(bat));
   // Invoke java directly rather than jmeter.bat: the .bat's error path ends in
-  // `pause`, which can wedge a headless agent forever.
-  const javaExe = env.JAVA_HOME ? path.join(env.JAVA_HOME, 'bin', 'java.exe') : 'java';
+  // `pause`, which can wedge a headless agent forever. Use the java that was
+  // actually checked: an inherited JAVA_HOME can point at an uninstalled Java.
+  const javaExe = bundledJava || 'java';
   return { home, env, javaExe };
 }
 
@@ -340,7 +453,13 @@ function startStub(workDir, props, hint) {
 // ---------- job runner ----------
 
 let ws = null;
-let current = null; // {runId, proc, tailer}
+let current = null; // {runId, proc, tailer} — set while JMeter itself runs
+// The run this agent is busy with from the moment the job arrives until 'done'
+// is sent: preparing (downloads, JMeter bootstrap), running, AND uploading.
+// Everything that must not happen mid-run checks THIS, not `current`.
+let busyRunId = null;
+let cancelRequested = false; // Stop pressed before JMeter started
+class StoppedBeforeStart extends Error {}
 
 function send(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -374,21 +493,46 @@ function resStats() {
 }
 let resTimer = null;
 
+// Each run leaves its plan, data files, results and captured responses in a
+// work folder. The controller keeps the real copies, so only the most recent
+// few stay here (a fallback if an upload failed) — otherwise the worker PC's
+// disk fills up run after run.
+const KEEP_WORK_RUNS = 5;
+function pruneWorkDirs(agentDir, current) {
+  let dirs;
+  try { dirs = fs.readdirSync(agentDir, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name !== current); } catch { return; }
+  const byAge = dirs
+    .map((d) => { try { return { name: d.name, t: fs.statSync(path.join(agentDir, d.name)).mtimeMs }; } catch { return null; } })
+    .filter(Boolean)
+    .sort((x, y) => y.t - x.t);
+  for (const old of byAge.slice(KEEP_WORK_RUNS - 1)) { // -1: the current run counts as one
+    try { fs.rmSync(path.join(agentDir, old.name), { recursive: true, force: true }); } catch { /* in use — next time */ }
+  }
+}
+
 async function runJob(job) {
   const { runId, files, props = {}, heap = '4g', uploadUrl, errorsUploadUrl, hint } = job;
   // Name in the path so two agents on one PC (dev/testing) don't collide.
-  const workDir = path.join(WORK_DIR, config.name.replace(/[^\w.-]/g, '_'), runId.replace(/[^\w.-]/g, '_'));
+  const agentDir = path.join(WORK_DIR, config.name.replace(/[^\w.-]/g, '_'));
+  const runDirName = runId.replace(/[^\w.-]/g, '_');
+  const workDir = path.join(agentDir, runDirName);
   fs.mkdirSync(workDir, { recursive: true });
+  pruneWorkDirs(agentDir, runDirName);
   const report = (line) => { log(`[${runId}]`, line); send({ type: 'runLog', runId, line }); };
+  const checkCancel = () => { if (cancelRequested) throw new StoppedBeforeStart('stopped before JMeter started'); };
+  busyRunId = runId;
+  cancelRequested = false;
 
   try {
     send({ type: 'jobStatus', runId, state: 'preparing' });
     send({ type: 'status', state: 'running', runId });
 
     for (const f of files) {
+      checkCancel();
       report(`downloading ${f.name}`);
       await download(`${config.controller}${f.url}`, path.join(workDir, f.name.replace(/[^\w.-]/g, '_')));
     }
+    checkCancel();
 
     const resultsFile = path.join(workDir, 'results.jtl');
     if (fs.existsSync(resultsFile)) fs.unlinkSync(resultsFile);
@@ -401,6 +545,7 @@ async function runJob(job) {
       proc = startStub(workDir, props, hint);
     } else {
       const { home, env, javaExe } = await ensureJmeter(report);
+      checkCancel(); // Stop pressed while JMeter was downloading — never start the load
       const args = ['-Xms1g', `-Xmx${heap}`,
         '-jar', path.join(home, 'bin', 'ApacheJMeter.jar'),
         '-n', '-t', 'plan.jmx', '-l', 'results.jtl', '-j', 'jmeter.log'];
@@ -421,7 +566,12 @@ async function runJob(job) {
 
     current.tailer = new JtlTailer(resultsFile, (rows) => send({ type: 'samples', runId, rows }));
 
-    const exitCode = await new Promise((resolve) => proc.once('exit', resolve));
+    // 'error' (e.g. java.exe missing) fires INSTEAD of 'exit' — without this the
+    // agent would crash, or wait forever for an exit that never comes.
+    const exitCode = await new Promise((resolve) => {
+      proc.once('exit', resolve);
+      proc.once('error', (e) => { report(`could not start JMeter: ${e.message}`); resolve(-1); });
+    });
     current.tailer.stop();
     const totalRows = current.tailer.rowCount;
     current = null;
@@ -441,16 +591,30 @@ async function runJob(job) {
     }
     send({ type: 'done', runId, exitCode, uploaded, totalRows });
   } catch (e) {
-    report(`job failed: ${e.message}`);
-    send({ type: 'error', runId, message: e.message });
     current = null;
+    if (e instanceof StoppedBeforeStart) {
+      // a clean stop, not a failure: no load was ever sent
+      report('stopped before JMeter started — no load was sent');
+      send({ type: 'done', runId, exitCode: 143, uploaded: false, totalRows: 0 });
+    } else {
+      report(`job failed: ${e.message}`);
+      send({ type: 'error', runId, message: e.message });
+    }
   } finally {
+    busyRunId = null;
+    cancelRequested = false;
     send({ type: 'status', state: 'idle', jmeterReady: !!findJmeterBat() });
   }
 }
 
 function stopJob(runId) {
-  if (!current || current.runId !== runId) return;
+  if (busyRunId !== runId) return;
+  if (!current) {
+    // still downloading / bootstrapping: make sure JMeter is never launched
+    log(`stop requested for run ${runId} while preparing — will not start JMeter`);
+    cancelRequested = true;
+    return;
+  }
   log(`stopping run ${runId}`);
   const { proc } = current;
   if (proc.pid) spawnSync('taskkill', ['/pid', String(proc.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
@@ -466,12 +630,27 @@ const CONTROL_PORT = 4101;
 
 /** Point this agent at a new controller and reconnect. `persist` writes config.json
  *  (the control endpoint does; the config-watcher does not, to avoid a write loop). */
-function switchController(url, persist = true) {
+/** A controller address the agent can actually use, or throws. */
+function cleanControllerUrl(url) {
   const clean = String(url || '').trim().replace(/\/+$/, '');
-  if (!/^https?:\/\//.test(clean)) throw new Error('bad url (must start with http://)');
+  let u;
+  try { u = new URL(clean); } catch { throw new Error('bad url'); }
+  if (!/^https?:$/.test(u.protocol) || !u.hostname || u.pathname.replace(/\/+$/, '') || u.search || u.hash) {
+    throw new Error('bad url (expected http://HOST:PORT)');
+  }
+  return `${u.protocol}//${u.host}`;
+}
+
+function switchController(url, persist = true) {
+  const clean = cleanControllerUrl(url);
   if (clean === config.controller) return; // already pointed here — nothing to do
   config.controller = clean;
-  if (persist) { try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2)); } catch { /* ignore */ } }
+  if (persist) {
+    // Remember the install-time address this redirect replaced, so a reboot (the
+    // task re-passes that address) keeps following the controller that claimed us.
+    config.redirect = { from: INSTALL_URL || null, at: new Date().toISOString() };
+    try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2)); } catch { /* ignore */ }
+  }
   log(`controller changed to ${clean} — reconnecting`);
   try { if (ws) ws.terminate(); } catch { /* the close handler reconnects to the new controller */ }
 }
@@ -484,7 +663,7 @@ function watchConfigForController() {
     fs.watchFile(CONFIG_FILE, { interval: 1000 }, () => {
       try {
         const disk = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-        if (disk.controller && disk.controller !== config.controller && !current) {
+        if (disk.controller && disk.controller !== config.controller && !busyRunId) {
           log(`config.json controller changed to ${disk.controller} (by another instance on this PC) — following`);
           switchController(disk.controller, false);
         }
@@ -508,6 +687,8 @@ function installBatText(exe, url) {
     'netsh advfirewall firewall delete rule name="LoadPilot Agent Control" >nul 2>&1',
     'netsh advfirewall firewall add rule name="LoadPilot Agent Control" dir=in action=allow protocol=TCP localport=4101 >nul 2>&1',
     `schtasks /Create /F /TN "LoadPilotAgent" /TR "\\"${exe}\\" ${url} --no-stub" /SC ONSTART /RU SYSTEM /RL HIGHEST`,
+    // Windows defaults would stop the agent after 3 days and skip it on battery; restart it after a crash
+    'powershell -NoProfile -Command "Set-ScheduledTask -TaskName LoadPilotAgent -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1))" >nul 2>&1',
     'schtasks /Run /TN "LoadPilotAgent" >nul 2>&1',
     'exit /b 0',
   ].join('\r\n');
@@ -572,18 +753,31 @@ function ensureFirewallRule() {
 
 function startControlServer() {
   const srv = http.createServer((req, res) => {
-    const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(obj)); };
+    // No CORS header: only the controller (a server, not a browser) talks to this port.
+    const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
     const url = (req.url || '').split('?')[0];
     if (req.method === 'GET' && (url === '/lp-agent/ping' || url === '/')) {
-      return send(200, { ok: true, app: 'loadpilot-agent', name: config.name, controller: config.controller, version: AGENT_VERSION, busy: !!current });
+      return send(200, { ok: true, app: 'loadpilot-agent', name: config.name, controller: config.controller, version: AGENT_VERSION, busy: !!busyRunId });
     }
     if (req.method === 'POST' && url === '/lp-agent/set-controller') {
+      // Real JSON only: a web page can't send this cross-site without a CORS
+      // preflight (which this server never answers), so a page open in someone's
+      // browser can't silently re-point the agents.
+      if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) {
+        req.resume();
+        return send(415, { ok: false, error: 'content-type must be application/json' });
+      }
       let body = '';
       req.on('data', (d) => { body += d; if (body.length > 10000) req.destroy(); });
-      req.on('end', () => {
+      req.on('end', async () => {
         let target;
-        try { target = JSON.parse(body).url; } catch { return send(400, { ok: false, error: 'bad json' }); }
-        if (current) return send(409, { ok: false, busy: true, name: config.name, message: 'agent is running a test — redirect skipped' });
+        try { target = cleanControllerUrl(JSON.parse(body).url); } catch (e) { return send(400, { ok: false, error: e.message === 'bad url' || /bad url/.test(e.message) ? e.message : 'bad json' }); }
+        if (busyRunId) return send(409, { ok: false, busy: true, name: config.name, message: 'agent is running a test — redirect skipped' });
+        // Only follow an address that answers like a LoadPilot controller — and
+        // that THIS PC can reach; otherwise the agent would be stranded.
+        const meta = await getJson(`${target}/bundle/meta`, 2500);
+        if (!meta || typeof meta !== 'object') return send(400, { ok: false, error: `this PC can't reach a LoadPilot controller at ${target}` });
+        if (busyRunId) return send(409, { ok: false, busy: true, name: config.name, message: 'agent is running a test — redirect skipped' });
         try { switchController(target); send(200, { ok: true, name: config.name, controller: config.controller }); }
         catch (e) { send(400, { ok: false, error: e.message }); }
       });
@@ -600,7 +794,15 @@ function startControlServer() {
 
 function connect() {
   const wsUrl = config.controller.replace(/^http/, 'ws') + '/ws/agent';
-  ws = new WebSocket(wsUrl);
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch (e) {
+    // a malformed address throws right here (not via 'error') — never crash, keep retrying
+    log(`can't connect to "${config.controller}" (${e.message}) — retrying in 15s; fix the controller address`);
+    ws = null;
+    setTimeout(connect, 15000);
+    return;
+  }
 
   ws.on('open', () => {
     log(`connected to ${wsUrl} as "${config.name}"`);
@@ -614,8 +816,8 @@ function connect() {
       jmeterReady: !!findJmeterBat(),
       stub: !!config.stub,
     });
-    send(current
-      ? { type: 'status', state: 'running', runId: current.runId, jmeterReady: !!findJmeterBat() }
+    send(busyRunId
+      ? { type: 'status', state: 'running', runId: busyRunId, jmeterReady: !!findJmeterBat() }
       : { type: 'status', state: 'idle', jmeterReady: !!findJmeterBat() });
     // stream CPU/RAM every 2s so the controller can flag a saturated agent
     lastCpuSample = os.cpus();
@@ -627,7 +829,7 @@ function connect() {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
     if (msg.type === 'job') {
-      if (current) return send({ type: 'error', runId: msg.runId, message: 'agent is busy' });
+      if (busyRunId) return send({ type: 'error', runId: msg.runId, message: `agent is busy with run ${busyRunId}` });
       runJob(msg);
     } else if (msg.type === 'stop') {
       stopJob(msg.runId);
@@ -636,7 +838,7 @@ function connect() {
       config.name = msg.name;
     } else if (msg.type === 'shutdown') {
       log('shutdown requested from controller - exiting.');
-      if (current) stopJob(current.runId);
+      if (busyRunId) stopJob(busyRunId);
       setTimeout(() => process.exit(0), 500);
     }
   });

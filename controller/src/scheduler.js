@@ -13,6 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { writeJsonAtomic } = require('./fsutil');
 
 function nowId() {
   return 'sch_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -58,10 +59,19 @@ class Scheduler {
   }
 
   _load() {
-    try { return JSON.parse(fs.readFileSync(this.file, 'utf8')); } catch { return []; }
+    if (!fs.existsSync(this.file)) return [];
+    try {
+      const list = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      return Array.isArray(list) ? list : [];
+    } catch {
+      // unreadable (half-written, locked…): keep a copy so the save that follows
+      // doesn't silently erase every schedule
+      try { fs.copyFileSync(this.file, `${this.file}.unreadable-${Date.now()}`); } catch { /* ignore */ }
+      return [];
+    }
   }
   _save() {
-    try { fs.writeFileSync(this.file, JSON.stringify(this.schedules, null, 2)); } catch { /* ignore */ }
+    try { writeJsonAtomic(this.file, this.schedules); } catch { /* ignore */ }
   }
 
   list() {

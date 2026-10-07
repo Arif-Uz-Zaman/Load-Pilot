@@ -16,7 +16,8 @@ const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 
-const { parseJmx } = require('./jmx');
+const { parseJmx, PARSER_VERSION } = require('./jmx');
+const { writeJsonAtomic } = require('./fsutil');
 const { AgentHub } = require('./agents');
 const { RunManager, findJmeter } = require('./runs');
 const { Scheduler } = require('./scheduler');
@@ -35,10 +36,26 @@ fs.mkdirSync(LIB_DIR, { recursive: true });
 // The data-file LIBRARY persists across plan uploads: upload a CSV once and
 // every future JMX that references that name just works.
 function readLib() {
-  try { return JSON.parse(fs.readFileSync(path.join(LIB_DIR, 'files.json'), 'utf8')); } catch { return { files: [] }; }
+  const file = path.join(LIB_DIR, 'files.json');
+  if (!fs.existsSync(file)) return { files: [] };
+  try {
+    const lib = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return lib && Array.isArray(lib.files) ? lib : { files: [] };
+  } catch {
+    // Unreadable index: keep a copy instead of letting the next save replace it
+    // with an empty list (which would lose every data-file mapping).
+    try { fs.copyFileSync(file, `${file}.unreadable-${Date.now()}`); } catch { /* ignore */ }
+    return { files: [] };
+  }
 }
 function saveLib(lib) {
-  fs.writeFileSync(path.join(LIB_DIR, 'files.json'), JSON.stringify(lib, null, 2));
+  writeJsonAtomic(path.join(LIB_DIR, 'files.json'), lib);
+}
+// Header values are URL-encoded by the UI so names in any language survive HTTP.
+function hdr(req, name) {
+  const v = req.headers[name];
+  if (v == null) return undefined;
+  try { return decodeURIComponent(String(v)); } catch { return String(v); }
 }
 
 const app = express();
@@ -52,13 +69,16 @@ const wssAgent = new WebSocketServer({ noServer: true });
 const wssUi = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
-  const { pathname } = new URL(req.url, 'http://x');
+  let pathname;
+  try { ({ pathname } = new URL(req.url, 'http://x')); } catch { socket.destroy(); return; } // garbage request line
+  socket.on('error', () => { /* client vanished mid-handshake */ });
   if (pathname === '/ws/agent') {
     wssAgent.handleUpgrade(req, socket, head, (ws) => hub.attach(ws, req));
   } else if (pathname === '/ws/ui') {
     wssUi.handleUpgrade(req, socket, head, (ws) => {
       uiSockets.add(ws);
       ws.on('close', () => uiSockets.delete(ws));
+      ws.on('error', () => uiSockets.delete(ws)); // a malformed frame must not take the server down
       ws.send(JSON.stringify({ type: 'agents', agents: hub.list() }));
     });
   } else {
@@ -99,8 +119,11 @@ hub.startHeartbeat();
 
 // ---------- helpers ----------
 
+// Ids and names from requests become folder/file names. Keep only safe
+// characters and NEVER a leading dot: ".." would be the parent folder (the whole
+// data directory), "." the folder itself.
 function safeName(s) {
-  return String(s).replace(/[^\w.-]/g, '_');
+  return String(s).replace(/[^\w.-]/g, '_').replace(/^\.+/, (m) => '_'.repeat(m.length)) || '_';
 }
 
 function planDir(id) {
@@ -117,10 +140,13 @@ function readPlan(id) {
     const st = plan.structure;
     const stale = !st || !st.dataFileRefs || !st.variables // variables added later
       || st.dataFileRefs.some((r) => r.threadGroupId === undefined)
-      || (st.controllers || []).some((c) => c.seq === undefined); // tree metadata added later
+      || (st.controllers || []).some((c) => c.seq === undefined) // tree metadata added later
+      || st.parserV !== PARSER_VERSION; // helpers linked to their request, assertions, methods
     if (stale) {
       const xml = fs.readFileSync(path.join(planDir(id), 'original.jmx'), 'utf8');
       plan.structure = parseJmx(xml);
+      // save it, so the (slow) re-parse happens once per plan, not on every load
+      try { writeJsonAtomic(path.join(planDir(id), 'plan.json'), plan); } catch { /* read-only: re-parse next time */ }
     }
   } catch { /* keep stored structure */ }
   return plan;
@@ -143,25 +169,33 @@ app.post('/api/plans', rawBody, (req, res) => {
     fs.writeFileSync(path.join(dir, 'original.jmx'), xml);
     const plan = {
       id,
-      fileName: req.headers['x-filename'] || 'plan.jmx',
+      fileName: String(hdr(req, 'x-filename') || 'plan.jmx').slice(0, 200),
       name: structure.testPlanName,
       uploadedAt: new Date().toISOString(),
       files: [],
       structure,
     };
-    fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify(plan, null, 2));
+    writeJsonAtomic(path.join(dir, 'plan.json'), plan);
     res.json(plan);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
+// The list only needs header fields, so it reads plan.json directly — going
+// through readPlan() re-parsed every stale plan's JMX (100+ plans ≈ 20 s).
+function readPlanHeader(id) {
+  try {
+    const { structure, ...p } = JSON.parse(fs.readFileSync(path.join(planDir(id), 'plan.json'), 'utf8'));
+    return p;
+  } catch { return null; }
+}
+
 app.get('/api/plans', (_req, res) => {
   const list = fs.readdirSync(PLANS_DIR)
-    .map(readPlan)
+    .map(readPlanHeader)
     .filter(Boolean)
-    .sort((a, b) => (a.uploadedAt < b.uploadedAt ? 1 : -1))
-    .map(({ structure, ...p }) => p);
+    .sort((a, b) => (a.uploadedAt < b.uploadedAt ? 1 : -1));
   res.json(list);
 });
 
@@ -226,13 +260,35 @@ app.post('/api/plans/import-edited', express.json(), (req, res) => {
 //   per-agent — a separate upload per agent (all delivered under the same
 //               logical filename the JMX references)
 
-app.get('/api/library', (_req, res) => res.json(readLib()));
+// Per-agent files carry a short content fingerprint so the UI can warn when two
+// agents were given the SAME file (their virtual users would share accounts).
+// Cached by size+mtime, so an unchanged file is hashed once.
+const libHashCache = new Map();
+function libFileHash(stored) {
+  const p = path.join(LIB_DIR, stored);
+  try {
+    const st = fs.statSync(p);
+    const c = libHashCache.get(p);
+    if (c && c.mtimeMs === st.mtimeMs && c.size === st.size) return c.hash;
+    const hash = require('crypto').createHash('sha1').update(fs.readFileSync(p)).digest('hex').slice(0, 16);
+    libHashCache.set(p, { mtimeMs: st.mtimeMs, size: st.size, hash });
+    return hash;
+  } catch { return null; }
+}
+function libFilesForUi(lib) {
+  return (lib.files || []).map((f) => (f.perAgent && Object.keys(f.perAgent).length
+    ? { ...f, perAgentHash: Object.fromEntries(Object.entries(f.perAgent).map(([a, stored]) => [a, libFileHash(stored)])) }
+    : f));
+}
+
+app.get('/api/library', (_req, res) => res.json({ ...readLib(), files: libFilesForUi(readLib()) }));
 
 app.post('/api/library/files', rawBody, (req, res) => {
   const lib = readLib();
-  const logical = safeName(req.headers['x-filename'] || 'data.csv');
+  const logical = safeName(hdr(req, 'x-filename') || 'data.csv');
+  if (/^files\.json$/i.test(logical)) return res.status(400).json({ error: '"files.json" is reserved — rename the file' });
   const mode = ['shared', 'split', 'per-agent'].includes(req.headers['x-mode']) ? req.headers['x-mode'] : 'shared';
-  const agent = req.headers['x-agent'] ? safeName(req.headers['x-agent']) : null;
+  const agent = hdr(req, 'x-agent') ? safeName(hdr(req, 'x-agent')) : null;
   if (mode === 'per-agent' && !agent) return res.status(400).json({ error: 'x-agent header required for per-agent files' });
 
   const stored = mode === 'per-agent' ? `agent__${agent}__${logical}` : logical;
@@ -253,7 +309,7 @@ app.post('/api/library/files', rawBody, (req, res) => {
   if (mode === 'per-agent') { entry.perAgent[agent] = stored; entry.perAgentOrig[agent] = { name: origName, bytes }; }
   else { entry.stored = stored; entry.origName = origName; entry.bytes = bytes; }
   saveLib(lib);
-  res.json({ ok: true, files: lib.files });
+  res.json({ ok: true, files: libFilesForUi(lib) });
 });
 
 // Update a library file's mode / header flag, or rename its logical name
@@ -266,6 +322,7 @@ app.patch('/api/library/files/:logical', express.json(), (req, res) => {
   if (typeof req.body.hasHeader === 'boolean') entry.hasHeader = req.body.hasHeader;
   if (req.body.renameTo) {
     const to = safeName(req.body.renameTo);
+    if (/^files\.json$/i.test(to)) return res.status(400).json({ error: '"files.json" is reserved — pick another name' });
     if (lib.files.some((f) => f !== entry && f.logical === to)) {
       return res.status(400).json({ error: `a data file named ${to} already exists` });
     }
@@ -285,7 +342,7 @@ app.patch('/api/library/files/:logical', express.json(), (req, res) => {
     }
   }
   saveLib(lib);
-  res.json({ ok: true, files: lib.files });
+  res.json({ ok: true, files: libFilesForUi(lib) });
 });
 
 app.delete('/api/library/files/:logical', (req, res) => {
@@ -298,7 +355,7 @@ app.delete('/api/library/files/:logical', (req, res) => {
   }
   lib.files.splice(i, 1);
   saveLib(lib);
-  res.json({ ok: true, files: lib.files });
+  res.json({ ok: true, files: libFilesForUi(lib) });
 });
 
 // Agents download library files from here during a run.
@@ -396,7 +453,7 @@ function triggerRun(planId, config) {
   }
   const requiredNames = (((plan.structure || {}).dataFileRefs) || [])
     .filter((r) => r.enabled && (r.threadGroupId == null || enabledTgIds.has(r.threadGroupId)))
-    .map((r) => r.name);
+    .map((r) => safeName(r.name)); // the library stores files under their safe name
   return runs.startRun({
     plan: { id: plan.id, name: plan.name, xml, requiredNames },
     config,
@@ -474,14 +531,34 @@ app.get('/api/runs/:id/files/:name', (req, res) => {
 });
 
 // Agents stream their full JTL here when the job ends (can be large — stream to disk).
+// Agent uploads (results / error captures). An upload cut off mid-way is
+// deleted, never kept as a partial file that would later be merged into results.
+function receiveUpload(req, res, file) {
+  const tmp = `${file}.part`;
+  const out = fs.createWriteStream(tmp);
+  let failed = false;
+  const fail = (code, msg) => {
+    if (failed) return;
+    failed = true;
+    out.destroy();
+    fs.rm(tmp, { force: true }, () => {});
+    if (!res.headersSent) res.status(code).json({ error: msg });
+  };
+  req.on('aborted', () => fail(400, 'upload interrupted'));
+  req.on('error', (e) => fail(400, e.message));
+  out.on('error', (e) => fail(500, e.message));
+  out.on('finish', () => {
+    if (failed) return;
+    try { fs.renameSync(tmp, file); res.json({ ok: true }); } catch (e) { fail(500, e.message); }
+  });
+  req.pipe(out);
+}
+
 app.post('/api/runs/:id/results', (req, res) => {
   const dir = runs.runDir(req.params.id);
   if (!fs.existsSync(dir)) return res.status(404).json({ error: 'run not found' });
   const agent = safeName(req.query.agent || 'unknown');
-  const out = fs.createWriteStream(path.join(dir, `results-${agent}.jtl`));
-  req.pipe(out);
-  out.on('finish', () => res.json({ ok: true }));
-  out.on('error', (e) => res.status(500).json({ error: e.message }));
+  receiveUpload(req, res, path.join(dir, `results-${agent}.jtl`));
 });
 
 // Results file for the whole run (merged) or one agent's share of it.
@@ -499,10 +576,16 @@ function runTgNames(id) {
   if (runs.active && runs.active.id === id) return runs.active.tgNames || [];
   if (tgNamesCache.has(id)) return tgNamesCache.get(id);
   let names = [];
-  try {
-    names = parseJmx(fs.readFileSync(path.join(runs.runDir(id), 'plan.jmx'), 'utf8'))
-      .threadGroups.map((t) => t.name);
-  } catch { /* run without a stored plan */ }
+  const dir = runs.runDir(id);
+  // the run's own record lists its groups (fast, and covers per-agent runs,
+  // which store plan-<agent>.jmx files instead of one plan.jmx)
+  try { names = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8')).tgNames || []; } catch { /* older run */ }
+  if (!names.length) {
+    try {
+      const planFile = fs.existsSync(path.join(dir, 'plan.jmx')) ? 'plan.jmx' : fs.readdirSync(dir).find((f) => /^plan-.*\.jmx$/.test(f));
+      if (planFile) names = parseJmx(fs.readFileSync(path.join(dir, planFile), 'utf8')).threadGroups.map((t) => t.name);
+    } catch { /* run without a stored plan */ }
+  }
   tgNamesCache.set(id, names);
   return names;
 }
@@ -567,45 +650,84 @@ app.post('/api/runs/:id/errors', (req, res) => {
   const dir = runs.runDir(req.params.id);
   if (!fs.existsSync(dir)) return res.status(404).json({ error: 'run not found' });
   const agent = safeName(req.query.agent || 'unknown');
-  const out = fs.createWriteStream(path.join(dir, `errors-${agent}.xml`));
-  req.pipe(out);
-  out.on('finish', () => res.json({ ok: true }));
-  out.on('error', (e) => res.status(500).json({ error: e.message }));
+  receiveUpload(req, res, path.join(dir, `errors-${agent}.xml`));
+});
+
+// Parsed error captures (errors-<agent>.xml) for ONE run at a time — the run
+// being looked at — so paging through its examples doesn't re-parse every file
+// on each click. Very large captures aren't kept in memory (parsed per request).
+const ERR_CACHE_MAX_BYTES = 48 * 1024 * 1024;
+let errCache = { runId: null, files: new Map() };
+function runErrorEntries(runId, agentFilter) {
+  const dir = runs.runDir(runId);
+  if (errCache.runId !== runId) errCache = { runId, files: new Map() };
+  const files = fs.readdirSync(dir).filter((f) => /^errors-(.*)\.xml$/.test(f));
+  const totalBytes = files.reduce((n, f) => n + fs.statSync(path.join(dir, f)).size, 0);
+  const perAgent = [];
+  let tooBig = false;
+  for (const f of files) {
+    const agent = /^errors-(.*)\.xml$/.exec(f)[1];
+    if (agentFilter && agent !== safeName(agentFilter)) continue;
+    const p = path.join(dir, f);
+    const st = fs.statSync(p);
+    let c = errCache.files.get(f);
+    if (!c || c.mtimeMs !== st.mtimeMs || c.size !== st.size) {
+      c = { mtimeMs: st.mtimeMs, size: st.size, parsed: parseErrorsXml(p, 100000) };
+      if (totalBytes <= ERR_CACHE_MAX_BYTES) errCache.files.set(f, c);
+    }
+    if (c.parsed.tooBig) tooBig = true;
+    perAgent.push({ agent, entries: c.parsed.entries });
+  }
+  return { perAgent, tooBig };
+}
+// Every captured example of one error type, taken round-robin across agents so
+// one PC's file can't crowd out what the other PCs sent. Stable order → pageable.
+function errorExamplesFor(perAgent, label, code, tg, tgNames) {
+  const { resolveTg } = require('./stats');
+  const lists = perAgent.map(({ agent, entries }) => entries
+    .filter((e) => e.label === label && e.code === code && (!tg || resolveTg(e.thread || '', tgNames) === tg))
+    .map((e) => ({ agent, ...e })));
+  const out = [];
+  for (let i = 0; lists.some((l) => i < l.length); i++) for (const l of lists) if (i < l.length) out.push(l[i]);
+  return out;
+}
+
+// One page of captured examples for an error type (sampler + response code).
+app.get('/api/runs/:id/error-examples', (req, res) => {
+  if (!fs.existsSync(runs.runDir(req.params.id))) return res.status(404).json({ error: 'run not found' });
+  try {
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 25));
+    const tgNames = req.query.tg ? runTgNames(req.params.id) : null;
+    const { perAgent } = runErrorEntries(req.params.id, req.query.agent);
+    const all = errorExamplesFor(perAgent, String(req.query.label || ''), String(req.query.code || ''), req.query.tg, tgNames);
+    res.json({ total: all.length, offset, examples: all.slice(offset, offset + limit) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Grouped error types with TRUE counts from the full results, each enriched
-// with a captured example response where available — the "Error Responses" tab.
+// with captured example responses where available — the run page's Errors tab.
 app.get('/api/runs/:id/error-summary', async (req, res) => {
   const file = resultsFile(req.params.id, req.query.agent);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'no results for this run/agent yet' });
   try {
     const sum = await errorSummaryFromJtl(file, tgOpts(req));
-    // Attach captured request+response examples to each group. Keep up to
-    // EXAMPLES_PER_TYPE per (sampler,code) so rare errors always get shown and
-    // common ones give several real cases to debug — bounded response size.
+    // Attach the first EXAMPLES_PER_TYPE captured request+response examples to
+    // each group (they carry full bodies, so the page stays light); the rest of
+    // the captured examples are paged in via /error-examples on demand.
     const EXAMPLES_PER_TYPE = 25;
+    const { perAgent, tooBig } = runErrorEntries(req.params.id, req.query.agent);
     const tgNames = req.query.tg ? runTgNames(req.params.id) : null;
-    const dir = runs.runDir(req.params.id);
-    const perType = new Map(); // "label|code" -> examples[]
-    let capTruncated = false, captured = 0;
-    for (const f of fs.readdirSync(dir)) {
-      const m = /^errors-(.*)\.xml$/.exec(f);
-      if (!m) continue;
-      if (req.query.agent && m[1] !== safeName(req.query.agent)) continue;
-      const parsed = parseErrorsXml(path.join(dir, f), 100000);
-      if (parsed.tooBig) capTruncated = true;
-      for (const e of parsed.entries) {
-        if (req.query.tg && require('./stats').resolveTg(e.thread || '', tgNames) !== req.query.tg) continue;
-        const key = `${e.label}|${e.code}`;
-        let arr = perType.get(key);
-        if (!arr) perType.set(key, (arr = []));
-        if (arr.length < EXAMPLES_PER_TYPE) { arr.push({ agent: m[1], ...e }); captured++; }
-      }
-    }
+    let captured = 0;
     for (const g of sum.groups) {
-      g.examples = perType.get(`${g.label}|${g.code}`) || [];
+      const all = errorExamplesFor(perAgent, g.label, g.code, req.query.tg, tgNames);
+      g.examples = all.slice(0, EXAMPLES_PER_TYPE);
+      g.captured = all.length;
+      captured += all.length;
     }
-    sum.captureTruncated = capTruncated;
+    sum.captureTruncated = tooBig;
     sum.captured = captured;
     res.json(sum);
   } catch (e) {
@@ -673,7 +795,9 @@ app.get('/api/runs/:id/merged.jtl', (req, res) => {
 });
 
 app.get('/api/runs/:id/log', (req, res) => {
-  const file = path.join(runs.runDir(req.params.id), 'run.log');
+  const dir = runs.runDir(req.params.id);
+  if (!fs.existsSync(path.join(dir, 'meta.json'))) return res.status(404).type('text/plain').send('Run not found.');
+  const file = path.join(dir, 'run.log');
   if (!fs.existsSync(file)) return res.type('text/plain').send('');
   res.type('text/plain').sendFile(file);
 });
@@ -683,6 +807,20 @@ app.use('/runs-static', express.static(path.join(DATA_DIR, 'runs')));
 
 // Agent bootstrap bundles: drop apache-jmeter zip as bundles/jmeter.zip (and a
 // JRE as bundles/jre.zip) and agents with nothing installed pull them from here.
+//
+// Bundle fingerprint = size + mtime. Agents remember which fingerprint they
+// extracted; when it changes (you swapped in a new JMeter), they re-download
+// automatically — no per-PC cache clearing. Route defined before the static
+// mount so it isn't shadowed.
+function bundleFingerprint(file) {
+  try { const st = fs.statSync(file); return `${st.size}-${Math.round(st.mtimeMs)}`; } catch { return null; }
+}
+app.get('/bundle/meta', (_req, res) => {
+  res.json({
+    jmeter: bundleFingerprint(path.join(cfg.bundlesDir, 'jmeter.zip')),
+    jre: bundleFingerprint(path.join(cfg.bundlesDir, 'jre.zip')),
+  });
+});
 app.use('/bundle', express.static(cfg.bundlesDir));
 
 // ---------- REST: SLA pass/fail thresholds ----------
@@ -696,9 +834,18 @@ function readSla() {
 app.get('/api/sla', (_req, res) => res.json(readSla()));
 app.put('/api/sla', express.json(), (req, res) => {
   const b = req.body || {};
-  const num = (v) => (v === null || v === '' || v === undefined || !Number.isFinite(+v) ? null : +v);
-  const sla = { maxErrorPct: num(b.maxErrorPct), maxP90Ms: num(b.maxP90Ms), minThroughput: num(b.minThroughput) };
-  try { fs.writeFileSync(SLA_FILE, JSON.stringify(sla, null, 2)); res.json({ ok: true, sla }); }
+  // empty = no limit; anything else must be a real, non-negative number — a typo
+  // must not silently REMOVE a limit (which "abc" → null used to do)
+  const errors = [];
+  const num = (v, label, max) => {
+    if (v === null || v === '' || v === undefined) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0 || (max != null && n > max)) { errors.push(`${label} must be a number from 0${max != null ? ` to ${max}` : ''}`); return null; }
+    return n;
+  };
+  const sla = { maxErrorPct: num(b.maxErrorPct, 'Error rate', 100), maxP90Ms: num(b.maxP90Ms, 'p90 response time'), minThroughput: num(b.minThroughput, 'Throughput') };
+  if (errors.length) return res.status(400).json({ error: errors.join('; ') });
+  try { writeJsonAtomic(SLA_FILE, sla); res.json({ ok: true, sla }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -998,6 +1145,41 @@ app.post('/api/agent-directory/discover', express.json(), async (_req, res) => {
   res.json({ scanned: ips.length, found });
 });
 
+// ---------- Teams: named agent groups for quick selection in New Run ----------
+const TEAMS_FILE = path.join(DATA_DIR, 'teams.json');
+function readTeams() {
+  try { return JSON.parse(fs.readFileSync(TEAMS_FILE, 'utf8')); } catch { return []; }
+}
+function writeTeams(list) { fs.writeFileSync(TEAMS_FILE, JSON.stringify(list, null, 2)); }
+function normTeamAgents(a) {
+  if (!Array.isArray(a)) return [];
+  return [...new Set(a.map((x) => String(x || '').trim()).filter(Boolean))];
+}
+app.get('/api/teams', (_req, res) => res.json(readTeams()));
+app.post('/api/teams', express.json(), (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'team name is required' });
+  const list = readTeams();
+  const team = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name, agents: normTeamAgents(b.agents), createdAt: new Date().toISOString() };
+  list.push(team);
+  try { writeTeams(list); res.json(team); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/teams/:id', express.json(), (req, res) => {
+  const list = readTeams();
+  const t = list.find((x) => x.id === req.params.id);
+  if (!t) return res.status(404).json({ error: 'team not found' });
+  const b = req.body || {};
+  if (b.name !== undefined) { const n = String(b.name).trim(); if (!n) return res.status(400).json({ error: 'team name is required' }); t.name = n; }
+  if (b.agents !== undefined) t.agents = normTeamAgents(b.agents);
+  try { writeTeams(list); res.json(t); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/teams/:id', (req, res) => {
+  const list = readTeams();
+  const next = list.filter((x) => x.id !== req.params.id);
+  try { writeTeams(next); res.json({ ok: true, removed: list.length - next.length }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ---------- REST: settings ----------
 
 app.get('/api/settings', (_req, res) => {
@@ -1032,10 +1214,33 @@ app.patch('/api/settings', express.json(), (req, res) => {
 // Static web UI. Read files via fs (works from the pkg snapshot too, where
 // express.static's stat-based streaming is unreliable).
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json' };
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.woff2': 'font/woff2' };
+// ---------- REST: stop the controller (Settings → General) ----------
+// Refuses while a test runs (stop the run first); `force` overrides. The reply
+// is sent first, then the process exits — the open page shows a "stopped" note.
+app.post('/api/shutdown', express.json(), (req, res) => {
+  if (runs.active && !(req.body && req.body.force)) {
+    return res.status(409).json({ error: `A test is running (${runs.active.planName || runs.active.id}). Stop it first, or stop the controller anyway.`, running: true });
+  }
+  // forced while a test runs: tell the agents to stop their JMeter first, so
+  // nothing keeps loading the target after the controller is gone
+  let wait = 400;
+  if (runs.active) {
+    try { runs.stopRun(runs.active.id); wait = 1500; } catch { /* already ending */ }
+  }
+  res.json({ ok: true });
+  console.log(`${new Date().toISOString()} Stop requested from the web UI - LoadPilot is shutting down.`);
+  broadcastUi({ type: 'controllerStopping' });
+  setTimeout(() => process.exit(0), wait);
+});
+
+// unknown API address: a JSON answer the UI can show, not Express's HTML page
+app.use('/api', (req, res) => res.status(404).json({ error: `No such API: ${req.method} ${req.originalUrl.split('?')[0]}` }));
+
 app.get(/.*/, (req, res, next) => {
   if (req.method !== 'GET') return next();
-  let rel = decodeURIComponent(req.path);
+  let rel;
+  try { rel = decodeURIComponent(req.path); } catch { return res.status(400).end(); }
   if (rel === '/' || rel === '') rel = '/index.html';
   if (rel.includes('..')) return res.status(400).end();
   const file = path.join(PUBLIC_DIR, rel);
@@ -1044,9 +1249,23 @@ app.get(/.*/, (req, res, next) => {
     res.setHeader('content-type', MIME[path.extname(file).toLowerCase()] || 'application/octet-stream');
     // The UI ships inside the controller exe and updates on every deploy — never
     // let the browser serve a stale app.js/style.css/index.html across updates.
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    // Bundled font files never change, so those may be cached.
+    res.setHeader('Cache-Control', path.extname(file).toLowerCase() === '.woff2'
+      ? 'public, max-age=31536000, immutable'
+      : 'no-cache, no-store, must-revalidate');
     res.send(buf);
   });
+});
+
+// Errors from the body parsers etc. come back as JSON the UI can show — not
+// Express's HTML error page.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (res.headersSent) return;
+  const status = err.type === 'entity.parse.failed' ? 400 : err.type === 'entity.too.large' ? 413 : (err.status || 500);
+  const msg = err.type === 'entity.parse.failed' ? 'The request was not valid JSON.'
+    : err.type === 'entity.too.large' ? 'The request is too large.' : (err.message || 'Server error');
+  res.status(status).json({ error: msg });
 });
 
 // ---------- first-run: extract bundled JMeter so report dashboards work ----------
@@ -1054,16 +1273,26 @@ app.get(/.*/, (req, res, next) => {
 function firstRunSetup() {
   try {
     fs.mkdirSync(cfg.runtimeDir, { recursive: true });
-    const hasJmeter = fs.existsSync(cfg.runtimeDir) &&
-      fs.readdirSync(cfg.runtimeDir).some((d) => d.toLowerCase().startsWith('apache-jmeter'));
     const zip = path.join(cfg.bundlesDir, 'jmeter.zip');
-    if (!hasJmeter && fs.existsSync(zip)) {
-      console.log('First run: extracting bundled JMeter for report generation...');
-      const { spawn } = require('child_process');
-      const p = spawn('powershell', ['-NoProfile', '-Command',
-        `Expand-Archive -LiteralPath '${zip}' -DestinationPath '${cfg.runtimeDir}' -Force`], { stdio: 'ignore' });
-      p.on('exit', (c) => console.log(c === 0 ? 'JMeter runtime ready.' : 'JMeter extract failed (dashboards disabled).'));
-    }
+    if (!fs.existsSync(zip)) return;
+    const marker = path.join(cfg.runtimeDir, '.jmeter-bundle-version');
+    const want = bundleFingerprint(zip);
+    const have = (() => { try { return fs.readFileSync(marker, 'utf8').trim(); } catch { return null; } })();
+    const existing = fs.readdirSync(cfg.runtimeDir).filter((d) => d.toLowerCase().startsWith('apache-jmeter'));
+    // Re-extract when there's no JMeter yet, or the bundle changed since last extract.
+    if (existing.length && have === want) return;
+    // Adopt an already-present JMeter as the current version (first run after this
+    // feature ships) so we don't needlessly re-extract an unchanged bundle.
+    if (existing.length && !have) { try { fs.writeFileSync(marker, want || ''); } catch { /* ignore */ } return; }
+    console.log(existing.length ? 'JMeter bundle changed — re-extracting runtime...' : 'First run: extracting bundled JMeter for report generation...');
+    for (const d of existing) { try { fs.rmSync(path.join(cfg.runtimeDir, d), { recursive: true, force: true }); } catch { /* ignore */ } }
+    const { spawn } = require('child_process');
+    const p = spawn('powershell', ['-NoProfile', '-Command',
+      `Expand-Archive -LiteralPath '${zip}' -DestinationPath '${cfg.runtimeDir}' -Force`], { stdio: 'ignore' });
+    p.on('exit', (c) => {
+      if (c === 0) { try { fs.writeFileSync(marker, want || ''); } catch { /* ignore */ } console.log('JMeter runtime ready.'); }
+      else console.log('JMeter extract failed (dashboards disabled).');
+    });
   } catch (e) { console.log('first-run setup skipped:', e.message); }
 }
 
@@ -1101,7 +1330,10 @@ server.on('error', (err) => {
   probe.on('error', () => exitWithMessage(`Port ${PORT} is used by another program. Change the port in config.json next to the exe, then start LoadPilot again.`));
 });
 
-process.on('uncaughtException', (err) => exitWithMessage(`Unexpected error: ${err.message}`));
+// A bug in one request handler must not take the whole controller (and a
+// running test) down, nor freeze it behind "Press Enter" — log it and carry on.
+process.on('uncaughtException', (err) => console.error(`${new Date().toISOString()} Unexpected error (LoadPilot keeps running): ${err && err.stack ? err.stack : err}`));
+process.on('unhandledRejection', (err) => console.error(`${new Date().toISOString()} Unexpected error (LoadPilot keeps running): ${err && err.stack ? err.stack : err}`));
 
 server.listen(PORT, '0.0.0.0', () => {
   const ips = Object.values(os.networkInterfaces())

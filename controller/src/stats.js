@@ -120,12 +120,14 @@ class RunStats {
       });
     }
 
+    const elapsed = this.firstTs === null ? 0 : Math.max(1, (this.lastTs - this.firstTs) / 1000);
     const perLabel = [...this.labels.entries()].map(([label, agg]) => ({
       label,
       samples: agg.count,
       errors: agg.errors,
       avg: agg.count ? Math.round(agg.sum / agg.count) : 0,
       max: agg.max,
+      throughput: elapsed > 0 ? +(agg.count / elapsed).toFixed(2) : 0,
     }));
 
     return {
@@ -263,7 +265,16 @@ function jtlCols(headerFields) {
     bytes: idx('bytes'), sentBytes: idx('sentBytes'),
     latency: idx('Latency'), connect: idx('Connect'), url: idx('URL'),
     allThreads: idx('allThreads'), grpThreads: idx('grpThreads'),
+    n: headerFields.length,
   };
+}
+
+// A real sample row: a 13-digit epoch-ms timestamp and every column present.
+// Rejects the torn last line a stopped/killed JMeter leaves behind, which would
+// otherwise count as a phantom failure or (cut inside the timestamp) stretch the
+// run to decades long and zero every throughput.
+function isSampleRow(f, cols, ts) {
+  return ts >= 1e12 && ts < 1e13 && (cols.n == null || f.length >= cols.n);
 }
 
 function newRichAgg() {
@@ -299,6 +310,10 @@ async function summarizeJtl(file, opts = {}) {
   const labels = new Map();
   const total = newRichAgg();
   let cols = null, firstTs = null, lastTs = null;
+  // Full-run span (all thread groups) — used as the throughput denominator so a
+  // filtered group's throughput is count ÷ TOTAL run time (JMeter's definition),
+  // not count ÷ the one second its samples happen to cluster in.
+  let gFirstTs = null, gLastTs = null;
   // Match JMeter: exclude redirect sub-samples from the summary (opt out with
   // opts.includeSubSamples).
   const subs = opts.includeSubSamples ? new Set() : await collectSubSampleLabels(file);
@@ -309,8 +324,10 @@ async function summarizeJtl(file, opts = {}) {
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
     const ts = parseInt(f[cols.ts], 10);
-    if (!Number.isFinite(ts)) continue;
+    if (!isSampleRow(f, cols, ts)) continue;
     if (subs.has(f[cols.label])) continue;
+    if (gFirstTs === null || ts < gFirstTs) gFirstTs = ts;
+    if (gLastTs === null || ts > gLastTs) gLastTs = ts;
     if (!tgMatches(f[cols.thread], opts)) continue;
     const elapsed = parseInt(f[cols.elapsed], 10) || 0;
     const ok = f[cols.success] === 'true';
@@ -333,7 +350,9 @@ async function summarizeJtl(file, opts = {}) {
     if (ts > lastTs) lastTs = ts;
   }
 
-  const durationSec = firstTs === null ? 0 : Math.max(1, (lastTs - firstTs) / 1000);
+  // Throughput uses the full-run span; a filtered subset that all timestamps in
+  // one second would otherwise report a wildly inflated rate (e.g. 500/sec).
+  const durationSec = gFirstTs === null ? 0 : Math.max(1, (gLastTs - gFirstTs) / 1000);
   return {
     startedTs: firstTs,
     endedTs: lastTs,
@@ -353,6 +372,7 @@ async function timelineFromJtl(file, opts = {}) {
   const maxPoints = opts.maxPoints || 240;
   const buckets = new Map();
   let cols = null;
+  let gMinSec = Infinity, gMaxSec = -Infinity; // full-run span (pre-filter), see timelineByLabel
   const subs = opts.includeSubSamples ? new Set() : await collectSubSampleLabels(file);
   const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
   for await (const line of rl) {
@@ -360,10 +380,12 @@ async function timelineFromJtl(file, opts = {}) {
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
     const ts = parseInt(f[cols.ts], 10);
-    if (!Number.isFinite(ts)) continue;
+    if (!isSampleRow(f, cols, ts)) continue;
+    const sec = Math.floor(ts / 1000);
+    if (sec < gMinSec) gMinSec = sec;
+    if (sec > gMaxSec) gMaxSec = sec;
     if (subs.has(f[cols.label])) continue;
     if (!tgMatches(f[cols.thread], opts)) continue;
-    const sec = Math.floor(ts / 1000);
     let b = buckets.get(sec);
     if (!b) buckets.set(sec, (b = { count: 0, errors: 0, sum: 0 }));
     b.count++;
@@ -372,10 +394,12 @@ async function timelineFromJtl(file, opts = {}) {
   }
   const secs = [...buckets.keys()].sort((a, b) => a - b);
   if (!secs.length) return [];
-  const span = secs[secs.length - 1] - secs[0] + 1;
+  const first = Math.min(secs[0], Number.isFinite(gMinSec) ? gMinSec : secs[0]);
+  const last = Math.max(secs[secs.length - 1], Number.isFinite(gMaxSec) ? gMaxSec : secs[secs.length - 1]);
+  const span = last - first + 1;
   const step = Math.max(1, Math.ceil(span / maxPoints));
   const points = [];
-  for (let s = secs[0]; s <= secs[secs.length - 1]; s += step) {
+  for (let s = first; s <= last; s += step) {
     let count = 0, errors = 0, sum = 0;
     for (let k = s; k < s + step; k++) {
       const b = buckets.get(k);
@@ -404,6 +428,10 @@ async function timelineByLabel(file, opts = {}) {
   const buckets = new Map();       // sec -> { threads, byLabel: Map(label -> {c,e,s}) }
   const labelTotals = new Map();   // label -> total count (for ranking)
   let cols = null, threadCol = -1;
+  // Full-run time span (across ALL rows, before the tg filter) so a filtered
+  // thread group still charts over the whole run instead of collapsing to the
+  // one second its samples happen to start in (long samplers all start at once).
+  let gMinSec = Infinity, gMaxSec = -Infinity;
   const subs = opts.includeSubSamples ? new Set() : await collectSubSampleLabels(file);
   const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
   for await (const line of rl) {
@@ -411,11 +439,13 @@ async function timelineByLabel(file, opts = {}) {
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); threadCol = cols.allThreads >= 0 ? cols.allThreads : cols.grpThreads; continue; }
     const ts = parseInt(f[cols.ts], 10);
-    if (!Number.isFinite(ts)) continue;
+    if (!isSampleRow(f, cols, ts)) continue;
+    const sec = Math.floor(ts / 1000);
+    if (sec < gMinSec) gMinSec = sec;
+    if (sec > gMaxSec) gMaxSec = sec;
     const label = f[cols.label] || '';
     if (subs.has(label)) continue;
     if (!tgMatches(f[cols.thread], opts)) continue;
-    const sec = Math.floor(ts / 1000);
     let b = buckets.get(sec);
     if (!b) buckets.set(sec, (b = { threads: 0, byLabel: new Map() }));
     let e = b.byLabel.get(label);
@@ -434,14 +464,16 @@ async function timelineByLabel(file, opts = {}) {
   const hasOther = ranked.length > TOP;
   const labels = ranked.slice(0, TOP).concat(hasOther ? ['Other'] : []);
 
-  const span = secs[secs.length - 1] - secs[0] + 1;
+  const first = Math.min(secs[0], Number.isFinite(gMinSec) ? gMinSec : secs[0]);
+  const last = Math.max(secs[secs.length - 1], Number.isFinite(gMaxSec) ? gMaxSec : secs[secs.length - 1]);
+  const span = last - first + 1;
   const step = Math.max(1, Math.ceil(span / maxPoints));
   const t = [];
   const series = {};
   for (const l of labels) series[l] = { tps: [], errors: [], avg: [] };
   const threads = threadCol >= 0 ? [] : null;
 
-  for (let s = secs[0]; s <= secs[secs.length - 1]; s += step) {
+  for (let s = first; s <= last; s += step) {
     t.push(s);
     let th = 0;
     const acc = {};
@@ -481,7 +513,7 @@ async function errorSummaryFromJtl(file, opts = {}) {
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
     const ts = parseInt(f[cols.ts], 10);
-    if (!Number.isFinite(ts)) continue;
+    if (!isSampleRow(f, cols, ts)) continue;
     if (!tgMatches(f[cols.thread], opts)) continue;
     totalSamples++;
     if (f[cols.success] === 'true') continue;
@@ -490,7 +522,7 @@ async function errorSummaryFromJtl(file, opts = {}) {
     const code = f[cols.code] || '';
     const msg = (f[cols.msg] || '').slice(0, 300);
     const failure = (f[cols.failure] || '').slice(0, 300);
-    const key = `${label} ${code} ${msg} ${failure}`;
+    const key = `${label}\u0000${code}\u0000${msg}\u0000${failure}`;
     let g = groups.get(key);
     if (!g) groups.set(key, (g = { label, code, msg, failure, count: 0, firstTs: ts, lastTs: ts }));
     g.count++;
@@ -514,7 +546,7 @@ async function sampleWindow(file, { offset = 0, limit = 100, errorsOnly = false,
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
     const ts = parseInt(f[cols.ts], 10);
-    if (!Number.isFinite(ts)) continue;
+    if (!isSampleRow(f, cols, ts)) continue;
     const ok = f[cols.success] === 'true';
     if (errorsOnly && ok) continue;
     if (!tgMatches(f[cols.thread], { tg, tgNames })) continue;
@@ -599,6 +631,7 @@ function parseErrorsXml(file, limit = 200, dedupeByType = false) {
       entries.push({
         t: parseInt(el.getAttribute('ts'), 10) || 0,
         elapsed: parseInt(el.getAttribute('t'), 10) || 0,
+        bytes: parseInt(el.getAttribute('by'), 10) || 0,
         label: el.getAttribute('lb') || '',
         thread: el.getAttribute('tn') || '',
         code: el.getAttribute('rc') || '',

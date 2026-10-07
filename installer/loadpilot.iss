@@ -43,6 +43,10 @@ Source: "..\controller\bundles\jmeter.zip"; DestDir: "{app}\bundles"; Flags: ign
 ; The agent installer files, so admins can copy them out to worker PCs.
 Source: "..\agent\dist\loadpilot-agent.exe"; DestDir: "{app}\agent"; Flags: ignoreversion
 Source: "..\agent\uninstall-agent.bat"; DestDir: "{app}\agent"; Flags: ignoreversion
+; One-double-click updater to roll the new agent out to a worker PC
+; (keeps the existing agent name/count/URL from the previous install).
+Source: "..\agent\update-agent.bat"; DestDir: "{app}\agent"; Flags: ignoreversion
+Source: "..\agent\update-agent.ps1"; DestDir: "{app}\agent"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Icons]

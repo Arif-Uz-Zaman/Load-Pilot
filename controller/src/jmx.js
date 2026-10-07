@@ -118,6 +118,75 @@ function isControllerTag(tag) {
   return tag.includes('Controller') || tag === 'InterleaveControl' || tag === 'RunTime';
 }
 
+/** The element whose hashTree directly holds `el` (its parent in the JMeter tree). */
+function treeParent(el) {
+  const h = el.parentNode;
+  if (!h || h.tagName !== 'hashTree') return null;
+  let prev = h.previousSibling;
+  while (prev && !isElement(prev)) prev = prev.previousSibling;
+  return prev || null;
+}
+
+// Bump when the parsed structure gains fields, so stored plans are re-parsed.
+const PARSER_VERSION = 2;
+
+// Short label for what kind of request a sampler sends (GET/POST, Script…).
+function samplerMethod(el) {
+  const tag = el.tagName || '';
+  if (tag === 'HTTPSamplerProxy' || tag === 'HTTPSampler') return (getPropText(el, 'HTTPSampler.method') || 'GET').toUpperCase();
+  if (/JSR223|BeanShell|Groovy/i.test(tag)) return 'Script';
+  if (tag === 'DebugSampler') return 'Debug';
+  if (/JDBC/i.test(tag)) return 'SQL';
+  if (/TCP/i.test(tag)) return 'TCP';
+  if (/SMTP|Mail/i.test(tag)) return 'Mail';
+  if (/FTP/i.test(tag)) return 'FTP';
+  if (/Flow|Test/i.test(tag)) return 'Flow';
+  return tag.replace(/Sampler(Proxy)?$/, '').replace(/^.*\./, '').slice(0, 8) || 'Other';
+}
+
+const TYPE_LABELS = {
+  XPathExtractor: 'XPath Extractor', XPath2Extractor: 'XPath Extractor', RegexExtractor: 'Regular Expression Extractor',
+  JSONPostProcessor: 'JSON Extractor', BoundaryExtractor: 'Boundary Extractor', HtmlExtractor: 'CSS Selector Extractor',
+  JSONPathExtractor: 'JSON Extractor', JSR223PostProcessor: 'JSR223 PostProcessor', JSR223PreProcessor: 'JSR223 PreProcessor',
+  BeanShellPreProcessor: 'BeanShell PreProcessor', BeanShellPostProcessor: 'BeanShell PostProcessor',
+  UserParameters: 'User Parameters', RegExUserParameters: 'RegEx User Parameters',
+  ResponseAssertion: 'Response Assertion', JSONPathAssertion: 'JSON Assertion', DurationAssertion: 'Duration Assertion',
+  SizeAssertion: 'Size Assertion', JSR223Assertion: 'JSR223 Assertion', BeanShellAssertion: 'BeanShell Assertion',
+  XPathAssertion: 'XPath Assertion', XPath2Assertion: 'XPath Assertion', HTMLAssertion: 'HTML Assertion',
+  CSVDataSet: 'CSV Data Set Config',
+};
+function typeLabel(tag) {
+  return TYPE_LABELS[tag] || String(tag).replace(/^.*\./, '').replace(/([a-z])([A-Z])/g, '$1 $2');
+}
+
+const EXTRACTOR_REF = {
+  XPathExtractor: 'XPathExtractor.refname', XPath2Extractor: 'XPathExtractor2.refname', RegexExtractor: 'RegexExtractor.refname',
+  JSONPostProcessor: 'JSONPostProcessor.referenceNames', BoundaryExtractor: 'BoundaryExtractor.refname', HtmlExtractor: 'HtmlExtractor.refname',
+};
+
+/** One-line plain description of an assertion ("response contains “Dashboard”"). */
+function assertionDetail(el) {
+  const tag = el.tagName;
+  if (tag === 'ResponseAssertion') {
+    const coll = getPropEl(el, 'Asserion.test_strings') || getPropEl(el, 'Assertion.test_strings');
+    const strings = [];
+    if (coll) for (let n = coll.firstChild; n; n = n.nextSibling) if (isElement(n)) strings.push(n.textContent || '');
+    const type = parseInt(getPropText(el, 'Assertion.test_type'), 10) || 2;
+    const field = getPropText(el, 'Assertion.test_field') || '';
+    const what = /response_code/.test(field) ? 'code' : /response_headers/.test(field) ? 'headers'
+      : /response_message/.test(field) ? 'message' : /sample_label|request/.test(field) ? 'request' : 'response';
+    const not = (type & 4) !== 0;
+    const verb = (type & 8) ? (not ? 'must not equal' : 'equals') : (type & 1) ? (not ? 'must not match' : 'matches')
+      : (not ? 'must not contain' : 'contains');
+    const first = strings[0] != null ? `“${strings[0].length > 80 ? `${strings[0].slice(0, 80)}…` : strings[0]}”` : '';
+    return `${what} ${verb} ${first}${strings.length > 1 ? ` (+${strings.length - 1} more)` : ''}`.trim();
+  }
+  if (tag === 'JSONPathAssertion') return `JSON path ${getPropText(el, 'JSON_PATH') || ''}`.trim();
+  if (tag === 'DurationAssertion') { const d = getPropText(el, 'DurationAssertion.duration'); return d ? `responds within ${d} ms` : ''; }
+  if (tag === 'SizeAssertion') { const s = getPropText(el, 'SizeAssertion.size'); return s ? `size check (${s} bytes)` : ''; }
+  return '';
+}
+
 function collect(doc) {
   const threadGroups = [];
   const samplers = [];
@@ -125,6 +194,7 @@ function collect(doc) {
   const csvSets = [];
   const preProcessors = [];
   const postProcessors = [];
+  const assertions = [];
   const plugins = new Set();
   let testPlanName = '';
   walk(doc.documentElement, (el) => {
@@ -148,9 +218,11 @@ function collect(doc) {
     } else if (el.getAttribute('testclass') && (/PostProcessor$/.test(tag) || /Extractor$/.test(tag))) {
       // extractors (RegexExtractor, JSON/XPath/Boundary/Html) are post-processors too
       postProcessors.push(el);
+    } else if (el.getAttribute('testclass') && /Assertion$/.test(tag)) {
+      assertions.push(el);
     }
   });
-  return { testPlanName, threadGroups, samplers, controllers, csvSets, preProcessors, postProcessors, plugins: [...plugins] };
+  return { testPlanName, threadGroups, samplers, controllers, csvSets, preProcessors, postProcessors, assertions, plugins: [...plugins] };
 }
 
 /** Bare file name out of a JMX file reference (handles both \ and / paths). */
@@ -199,7 +271,7 @@ function parseJmx(xml) {
   if (!root || root.tagName !== 'jmeterTestPlan') {
     throw new Error('Not a JMeter test plan (missing <jmeterTestPlan> root)');
   }
-  const { testPlanName, threadGroups, samplers, controllers, csvSets, preProcessors, postProcessors, plugins } = collect(doc);
+  const { testPlanName, threadGroups, samplers, controllers, csvSets, preProcessors, postProcessors, assertions, plugins } = collect(doc);
 
   // Document-order index per element — lets the UI interleave controllers and
   // samplers correctly when building the workload tree.
@@ -277,6 +349,7 @@ function parseJmx(xml) {
       id: i,
       tag: el.tagName,
       name: el.getAttribute('testname') || el.tagName,
+      method: samplerMethod(el),
       enabled: isEnabled(el),
       threadGroupId: tg ? threadGroups.indexOf(tg) : null,
       // ancestor controller ids, outermost -> innermost
@@ -297,30 +370,41 @@ function parseJmx(xml) {
     };
   });
 
-  // Non-sampler elements that shape the run — CSV Data Set Config + pre/post
-  // processors — surfaced so the tree shows what feeds and post-processes requests.
-  // They're informational (no split checkbox); position via owning group + seq.
+  // Non-sampler elements that shape the run — CSV Data Set Config, pre/post
+  // processors, extractors and assertions — so the tree shows what feeds, checks
+  // and post-processes each request. Informational (no split checkbox). An element
+  // inside a sampler's hashTree belongs to THAT sampler only (samplerId); one
+  // under a controller or the thread group applies to every request in that scope.
+  const isExtractor = (el) => /Extractor$/.test(el.tagName) || el.tagName === 'JSONPostProcessor';
   const auxSrc = [
     ...csvSets.map((el) => ({ el, role: 'csv' })),
     ...preProcessors.map((el) => ({ el, role: 'pre' })),
-    ...postProcessors.map((el) => ({ el, role: 'post' })),
+    ...postProcessors.map((el) => ({ el, role: isExtractor(el) ? 'extract' : 'post' })),
+    ...assertions.map((el) => ({ el, role: 'check' })),
   ];
   const aux = auxSrc.map(({ el, role }, i) => {
     const tg = owningThreadGroup(el);
+    const parent = treeParent(el);
+    const sIdx = parent ? samplers.indexOf(parent) : -1;
+    const ref = EXTRACTOR_REF[el.tagName] ? getPropText(el, EXTRACTOR_REF[el.tagName]) : null;
     return {
       id: i,
       role,
       tag: el.tagName,
+      type: typeLabel(el.tagName),
       name: el.getAttribute('testname') || el.tagName,
+      // what it does in a few words: the variable an extractor saves, what an assertion checks
+      detail: role === 'extract' ? (ref || '') : role === 'check' ? assertionDetail(el) : '',
       file: role === 'csv' ? baseName(getPropText(el, 'filename') || '') : undefined,
       enabled: isEnabled(el),
       threadGroupId: tg ? threadGroups.indexOf(tg) : null,
       ctrlIds: controllerPath(el).map((c) => controllers.indexOf(c)).filter((x) => x >= 0),
+      samplerId: sIdx >= 0 ? sIdx : null,
       seq: orderMap.get(el),
     };
   }).sort((a, b) => a.seq - b.seq);
 
-  return { testPlanName, threadGroups: tgInfos, samplers: samplerInfos, controllers: ctrlInfos, dataFileRefs, variables, aux, plugins };
+  return { parserV: PARSER_VERSION, testPlanName, threadGroups: tgInfos, samplers: samplerInfos, controllers: ctrlInfos, dataFileRefs, variables, aux, plugins };
 }
 
 /** Merged variable name->value map: plan UDV defaults, then per-run overrides win. */
@@ -475,8 +559,10 @@ function applyConfig(xml, config) {
   const uploadedNames = new Set(config.dataFileNames || []);
   for (const el of csvSets) {
     const raw = getPropText(el, 'filename') || '';
-    const name = baseName(raw);
-    if (raw !== name && uploadedNames.has(name)) setPropText(doc, el, 'filename', name);
+    // agents save downloads under the SAFE name ("Login Users.csv" -> "Login_Users.csv"), which
+    // is also the library's name for it — point the plan at exactly that file
+    const safe = baseName(raw).replace(/[^\w.-]/g, '_');
+    if (raw !== safe && uploadedNames.has(safe)) setPropText(doc, el, 'filename', safe);
   }
 
   injectErrorCapture(doc);
@@ -526,4 +612,4 @@ function injectErrorCapture(doc) {
   planTree.appendChild(doc.createElement('hashTree'));
 }
 
-module.exports = { parseJmx, applyConfig, extractTargets, THREADS_PROP_PREFIX };
+module.exports = { parseJmx, applyConfig, extractTargets, THREADS_PROP_PREFIX, PARSER_VERSION };
