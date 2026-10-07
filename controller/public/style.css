@@ -496,6 +496,9 @@ table.assign-matrix input[type="checkbox"] { width: 16px; height: 16px; accent-c
 .agent-pick label > span { min-width: 0; }
 .agent-pick label:has(input:checked) { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
 .agent-pick .meta { font-size: 11.5px; color: var(--muted); }
+/* CPU + RAM meters must fit a narrow card: shorter bars, and wrap rather than spill out */
+.agent-pick .resm { display: flex; flex-wrap: wrap; gap: 3px 10px; }
+.agent-pick .resm-bar { width: 32px; }
 .hint { color: var(--muted); font-size: 12px; margin: 12px 0 0; }
 
 /* ---------- stat tiles ---------- */
@@ -1187,7 +1190,7 @@ label.field.team-name-field { display: flex; max-width: 460px; }
 .team-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .team-card-name { font-size: 14.5px; }
 .team-card-sub { font-size: 11.5px; color: var(--ink-2); margin-top: -4px; }
-.team-card .team-chips { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
+.team-card .team-chips { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; align-content: flex-start; align-items: flex-start; } /* chips keep their height when the card grows */
 .team-chip {
   display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
   background: var(--surface); border: 1px solid var(--border); font-size: 12px; font-weight: 500;

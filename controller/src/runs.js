@@ -11,9 +11,8 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { createInterface } = require('readline');
 const { applyConfig, parseJmx, extractTargets } = require('./jmx');
-const { RunStats, summarizeJtl, resolveTg } = require('./stats');
+const { RunStats, summarizeJtl, resolveTg, jtlRecords } = require('./stats');
 const { writeJsonAtomic } = require('./fsutil');
 
 // A disconnected agent may come back (network blip, controller hiccup) and carry on.
@@ -594,7 +593,8 @@ class RunManager {
           torn = b[0] !== 0x0a;
         }
       } catch { /* unreadable: the reader below fails the same way */ }
-      const it = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity })[Symbol.asyncIterator]();
+      // whole records: a failed sample's multi-line failure message stays one row
+      const it = jtlRecords(file)[Symbol.asyncIterator]();
       return { it, torn, held: null, first: true, head: null, done: false };
     });
 

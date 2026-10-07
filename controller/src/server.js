@@ -627,7 +627,12 @@ app.get('/api/runs/:id/timeline-detail', async (req, res) => {
   const file = resultsFile(req.params.id, req.query.agent);
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'no results for this run/agent yet' });
   try {
-    res.json(await timelineByLabel(file, tgOpts(req)));
+    const opts = tgOpts(req);
+    if (!req.query.agent) { // whole run: users are added up across the agents' own files
+      const dir = runs.runDir(req.params.id);
+      try { opts.threadFiles = fs.readdirSync(dir).filter((f) => /^results-.*\.jtl$/.test(f)).map((f) => path.join(dir, f)); } catch { /* none */ }
+    }
+    res.json(await timelineByLabel(file, opts));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

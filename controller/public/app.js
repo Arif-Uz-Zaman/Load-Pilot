@@ -2594,15 +2594,18 @@ function drawArea(canvas, cfg) {
   } else {
     for (const se of series) for (const v of se.values) if (v > vMax) vMax = v;
   }
-  vMax = niceMax(vMax);
+  const sc = niceScale(vMax);
+  vMax = sc.max;
   const x = (i) => padL + (t.length === 1 ? plotW / 2 : (i / (t.length - 1)) * plotW);
   const y = (v) => padT + plotH - (v / vMax) * plotH;
   canvas._area.scale = { x, y, n: t.length };
 
   ctx.strokeStyle = css('--grid'); ctx.fillStyle = css('--muted'); ctx.lineWidth = 1; ctx.font = '11px system-ui'; ctx.textAlign = 'right';
-  for (let i = 0; i <= 4; i++) { const v = (vMax / 4) * i, yy = y(v); ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(w - padR, yy); ctx.stroke(); ctx.fillText(fmt.n(Math.round(v)), padL - 6, yy + 4); }
+  for (let v = 0; v <= vMax + 1e-9; v += sc.step) { const yy = y(v); ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(w - padR, yy); ctx.stroke(); ctx.fillText(fmt.n(Math.round(v)), padL - 6, yy + 4); }
   ctx.textAlign = 'center';
-  for (let i = 0; i <= 3; i++) { const idx = Math.round((t.length - 1) * i / 3); ctx.fillText(fmt.time(t[idx]), x(idx), h - 5); }
+  // the last label is right-aligned so it isn't cut off at the chart's edge
+  for (let i = 0; i <= 3; i++) { const idx = Math.round((t.length - 1) * i / 3); ctx.textAlign = i === 3 ? 'right' : 'center'; ctx.fillText(fmt.time(t[idx]), i === 3 ? Math.min(x(idx) + 20, w - 2) : x(idx), h - 5); }
+  ctx.textAlign = 'center';
   ctx.strokeStyle = css('--baseline'); ctx.beginPath(); ctx.moveTo(padL, y(0)); ctx.lineTo(w - padR, y(0)); ctx.stroke();
 
   if (cfg.stacked) {
@@ -2688,7 +2691,8 @@ function drawChart(canvas, series, opts = {}) {
 
   const t0 = Math.min(...allPts.map((p) => p.t));
   const t1 = Math.max(...allPts.map((p) => p.t));
-  const vMax = niceMax(Math.max(1, ...allPts.map((p) => p.v)));
+  const sc = niceScale(Math.max(1, ...allPts.map((p) => p.v)));
+  const vMax = sc.max;
   const x = (t) => padL + (t1 === t0 ? plotW / 2 : ((t - t0) / (t1 - t0)) * plotW);
   const y = (v) => padT + plotH - (v / vMax) * plotH;
   canvas._chart.scale = { t0, t1, vMax, x, y };
@@ -2699,8 +2703,8 @@ function drawChart(canvas, series, opts = {}) {
   ctx.lineWidth = 1;
   ctx.font = '11px system-ui';
   ctx.textAlign = 'right';
-  for (let i = 0; i <= 4; i++) {
-    const v = (vMax / 4) * i, yy = y(v);
+  for (let v = 0; v <= vMax + 1e-9; v += sc.step) {
+    const yy = y(v);
     ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(w - padR, yy); ctx.stroke();
     ctx.fillText(fmt.n(Math.round(v)), padL - 6, yy + 4);
   }
@@ -2708,8 +2712,10 @@ function drawChart(canvas, series, opts = {}) {
   ctx.textAlign = 'center';
   for (let i = 0; i <= 3; i++) {
     const t = t0 + ((t1 - t0) / 3) * i;
-    ctx.fillText(fmt.time(t), x(t), h - 5);
+    ctx.textAlign = i === 3 ? 'right' : 'center'; // keep the last label inside the chart
+    ctx.fillText(fmt.time(t), i === 3 ? Math.min(x(t) + 20, w - 2) : x(t), h - 5);
   }
+  ctx.textAlign = 'center';
   // baseline
   ctx.strokeStyle = css('--baseline');
   ctx.beginPath(); ctx.moveTo(padL, y(0)); ctx.lineTo(w - padR, y(0)); ctx.stroke();
@@ -2778,10 +2784,14 @@ function chartHover(canvas, e) {
   tip.style.top = (e.clientY - box.top - 10) + 'px';
 }
 
-function niceMax(v) {
-  const mag = Math.pow(10, Math.floor(Math.log10(v)));
-  for (const m of [1, 2, 2.5, 5, 10]) if (v <= m * mag) return m * mag;
-  return 10 * mag;
+// Axis with round steps (1, 2 or 5 x 10^n, whole numbers only) and about four
+// gridlines: labels read 0 / 20 / 40 / 60, never 13 / 25 / 38 or "1, 1, 2, 2".
+function niceScale(v) {
+  const top = Math.max(1, v);
+  const raw = top / 5;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = Math.max(1, [1, 2, 5, 10].map((m) => m * mag).find((x) => x >= raw));
+  return { max: Math.ceil(top / step) * step, step };
 }
 
 // ---------------- runs: one list of every run (replaces Dashboard + History) ----------------
@@ -3700,11 +3710,32 @@ function explainAssertion(msg) {
   if (!m) return null;
   const neg = !!m[1];
   const what = /\bcode\b/i.test(msg) ? 'response code' : /header/i.test(msg) ? 'response headers' : 'response';
+  // An "equals" failure carries JMeter's diff ("****** received : [[[5]]]00",
+  // "****** comparison: [[[2]]]00", with [[[ ]]] marking where they differ):
+  // show the two plain values instead of the raw diff.
+  if (/equal/i.test(m[2])) {
+    const plain = (s) => s.replace(/\[\[\[|\]\]\]/g, '').trim();
+    const rec = /\*{6} received\s*:\s*([\s\S]*?)\s*\*{6} comparison\s*:/i.exec(m[3]);
+    const cmp = /\*{6} comparison\s*:\s*([\s\S]*)$/i.exec(m[3]);
+    if (rec && cmp) {
+      const got = plain(rec[1]);
+      const want = plain(cmp[1]);
+      return {
+        pattern: want, neg,
+        text: neg ? `Response Assertion: the ${what} must not equal the value below, but it did.`
+          : `Response Assertion: the ${what} must equal the value below, but it was “${got.slice(0, 200)}”.`,
+        short: neg ? `The ${what} was “${want.slice(0, 70)}”`
+          : `The ${what} was “${got.slice(0, 40)}”, expected “${want.slice(0, 40)}”`,
+      };
+    }
+  }
+  const verb = /match/i.test(m[2]) ? 'match' : 'contain';
+  const did = verb === 'match' ? 'matched' : 'contained';
   return {
     pattern: m[3], neg,
-    text: neg ? `Response Assertion: the ${what} must not contain the text below, but it did.`
-      : `Response Assertion: the ${what} must contain the text below, but it didn't.`,
-    short: neg ? `The ${what} contained “${m[3].slice(0, 70)}”` : `The ${what} didn't contain “${m[3].slice(0, 70)}”`,
+    text: neg ? `Response Assertion: the ${what} must not ${verb} the text below, but it did.`
+      : `Response Assertion: the ${what} must ${verb} the text below, but it didn't.`,
+    short: neg ? `The ${what} ${did} “${m[3].slice(0, 70)}”` : `The ${what} didn't ${verb} “${m[3].slice(0, 70)}”`,
   };
 }
 
@@ -4591,7 +4622,7 @@ function renderHome() {
     const base = list.map((a) => a.name.replace(/[-_ ]?\d+$/, '')).sort((x, y) => x.length - y.length)[0] || list[0].name;
     const running = list.some((a) => a.state !== 'idle');
     return `<div class="pc-row">
-      <div class="pc-main"><b>${esc(base)} PC</b> <span class="hint" style="margin:0">${list.length} agent${list.length === 1 ? '' : 's'}</span>
+      <div class="pc-main"><b>${esc(base)}${/pc$/i.test(base) ? '' : ' PC'}</b> <span class="hint" style="margin:0">${list.length} agent${list.length === 1 ? '' : 's'}</span>
         <div class="pc-sub"><span class="mono">${esc(ip)}</span> · ${running ? '<span class="pc-busy">Running a test</span>' : 'Idle'}</div></div>
       <div class="pc-res">${resMeter(list[0].res, list[0].name)}</div>
     </div>`;

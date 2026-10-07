@@ -220,8 +220,7 @@ function tgMatches(threadName, opts) {
 async function collectSubSampleLabels(file) {
   const labels = new Set();
   let cols = null;
-  const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) {
+  for await (const line of jtlRecords(file)) {
     if (!line) continue;
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
@@ -254,6 +253,61 @@ function splitCsv(line) {
   }
   out.push(cur);
   return out;
+}
+
+// One JTL sample per record. JMeter quotes a field that holds a line break (an
+// assertion's failure message spans several lines), so one failed sample can
+// take several physical lines. Read line by line, it would be split apart and
+// the failure would vanish from every count. Lines are joined until the quotes
+// balance. A record still open when the next sample starts, or at the end of
+// the file, was cut off mid-write and is dropped.
+const RECORD_START = /^\d{13},-?\d+,/;
+const MAX_RECORD_CHARS = 1 << 20;
+function quoteCount(s) {
+  let n = 0;
+  for (let i = s.indexOf('"'); i !== -1; i = s.indexOf('"', i + 1)) n++;
+  return n;
+}
+async function* jtlRecords(file) {
+  const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+  let rec = null;
+  let quotes = 0;
+  for await (const line of rl) {
+    if (rec !== null) {
+      if (RECORD_START.test(line) || rec.length > MAX_RECORD_CHARS) {
+        rec = null; // torn: fall through and read this line as a new record
+      } else {
+        rec += `\n${line}`;
+        quotes += quoteCount(line);
+        if (quotes % 2 === 0) { const r = rec; rec = null; yield r; }
+        continue;
+      }
+    }
+    if (!line) continue;
+    const q = quoteCount(line);
+    if (q % 2 === 0) yield line;
+    else { rec = line; quotes = q; }
+  }
+}
+
+/**
+ * Highest active-thread count per second in one agent's results file. The
+ * merged file can't tell agents apart, so the run's "virtual users" line adds
+ * these up across agents (each agent's JMeter only counts its own threads).
+ */
+async function threadsPerSecond(file) {
+  const perSec = new Map();
+  let cols = null, threadCol = -1;
+  for await (const line of jtlRecords(file)) {
+    const f = splitCsv(line);
+    if (!cols) { cols = jtlCols(f); threadCol = cols.allThreads >= 0 ? cols.allThreads : cols.grpThreads; if (threadCol < 0) return perSec; continue; }
+    const ts = parseInt(f[cols.ts], 10);
+    if (!isSampleRow(f, cols, ts)) continue;
+    const sec = Math.floor(ts / 1000);
+    const at = parseInt(f[threadCol], 10) || 0;
+    if (at > (perSec.get(sec) || 0)) perSec.set(sec, at);
+  }
+  return perSec;
 }
 
 function jtlCols(headerFields) {
@@ -318,8 +372,7 @@ async function summarizeJtl(file, opts = {}) {
   // opts.includeSubSamples).
   const subs = opts.includeSubSamples ? new Set() : await collectSubSampleLabels(file);
 
-  const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) {
+  for await (const line of jtlRecords(file)) {
     if (!line) continue;
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
@@ -374,8 +427,7 @@ async function timelineFromJtl(file, opts = {}) {
   let cols = null;
   let gMinSec = Infinity, gMaxSec = -Infinity; // full-run span (pre-filter), see timelineByLabel
   const subs = opts.includeSubSamples ? new Set() : await collectSubSampleLabels(file);
-  const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) {
+  for await (const line of jtlRecords(file)) {
     if (!line) continue;
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
@@ -433,8 +485,7 @@ async function timelineByLabel(file, opts = {}) {
   // one second its samples happen to start in (long samplers all start at once).
   let gMinSec = Infinity, gMaxSec = -Infinity;
   const subs = opts.includeSubSamples ? new Set() : await collectSubSampleLabels(file);
-  const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) {
+  for await (const line of jtlRecords(file)) {
     if (!line) continue;
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); threadCol = cols.allThreads >= 0 ? cols.allThreads : cols.grpThreads; continue; }
@@ -473,6 +524,18 @@ async function timelineByLabel(file, opts = {}) {
   for (const l of labels) series[l] = { tps: [], errors: [], avg: [] };
   const threads = threadCol >= 0 ? [] : null;
 
+  // Several agents: each JMeter counts only its own threads, so the run's
+  // virtual users are the per-agent counts added up (from each agent's file).
+  const agentMaps = threads && Array.isArray(opts.threadFiles) && opts.threadFiles.length > 1
+    ? await Promise.all(opts.threadFiles.map((f) => threadsPerSecond(f).catch(() => new Map())))
+    : null;
+  const spans = agentMaps && agentMaps.map((m) => {
+    let lo = Infinity, hi = -Infinity;
+    for (const k of m.keys()) { if (k < lo) lo = k; if (k > hi) hi = k; }
+    return lo <= hi ? [lo, hi] : null;
+  });
+  const lastSeen = agentMaps ? agentMaps.map(() => 0) : null;
+
   for (let s = first; s <= last; s += step) {
     t.push(s);
     let th = 0;
@@ -494,7 +557,17 @@ async function timelineByLabel(file, opts = {}) {
       series[l].errors.push(a.e);
       series[l].avg.push(a.c ? Math.round(a.s / a.c) : 0);
     }
-    if (threads) threads.push(th);
+    if (threads && agentMaps) {
+      let sum = 0;
+      agentMaps.forEach((m, i) => {
+        let v = -1;
+        for (let k = s; k < s + step; k++) { const x = m.get(k); if (x != null && x > v) v = x; }
+        // a second with no finished request inside the agent's run keeps its last count
+        if (v < 0 && spans[i] && s + step - 1 >= spans[i][0] && s <= spans[i][1]) v = lastSeen[i];
+        if (v >= 0) { lastSeen[i] = v; sum += v; }
+      });
+      threads.push(sum);
+    } else if (threads) threads.push(th);
   }
   return { t, labels, series, threads };
 }
@@ -507,8 +580,7 @@ async function timelineByLabel(file, opts = {}) {
 async function errorSummaryFromJtl(file, opts = {}) {
   const groups = new Map();
   let cols = null, totalErrors = 0, totalSamples = 0;
-  const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) {
+  for await (const line of jtlRecords(file)) {
     if (!line) continue;
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
@@ -540,8 +612,7 @@ async function errorSummaryFromJtl(file, opts = {}) {
 async function sampleWindow(file, { offset = 0, limit = 100, errorsOnly = false, tg, tgNames }) {
   const rows = [];
   let cols = null, matched = 0, hasMore = false;
-  const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) {
+  for await (const line of jtlRecords(file)) {
     if (!line) continue;
     const f = splitCsv(line);
     if (!cols) { cols = jtlCols(f); continue; }
@@ -662,4 +733,4 @@ function parseErrorsXml(file, limit = 200, dedupeByType = false) {
   return { tooBig: false, entries };
 }
 
-module.exports = { RunStats, summarizeJtl, sampleWindow, timelineFromJtl, timelineByLabel, parseErrorsXml, resolveTg, errorSummaryFromJtl };
+module.exports = { RunStats, summarizeJtl, sampleWindow, timelineFromJtl, timelineByLabel, parseErrorsXml, resolveTg, errorSummaryFromJtl, jtlRecords };

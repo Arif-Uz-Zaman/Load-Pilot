@@ -365,6 +365,12 @@ function splitCsv(line) {
   return out;
 }
 
+function quoteCount(s) {
+  let n = 0;
+  for (let i = s.indexOf('"'); i !== -1; i = s.indexOf('"', i + 1)) n++;
+  return n;
+}
+
 /** Poll a growing JTL file, emit parsed rows [ts, elapsed, label, success, code]. */
 class JtlTailer {
   constructor(file, onRows) {
@@ -372,6 +378,8 @@ class JtlTailer {
     this.onRows = onRows;
     this.offset = 0;
     this.partial = '';
+    this.open = null;     // a quoted multi-line record still being read
+    this.openQuotes = 0;
     this.cols = null; // resolved from the header line
     this.rowCount = 0;
     this.timer = setInterval(() => this.poll(), 1000);
@@ -392,7 +400,25 @@ class JtlTailer {
     this.partial = lines.pop(); // last piece may be incomplete
 
     const rows = [];
-    for (const line of lines) {
+    for (const raw of lines) {
+      // A failure message with line breaks is one quoted field over several
+      // lines: join them until the quotes balance, so it stays one sample.
+      let line = raw;
+      if (this.open != null) {
+        if (/^\d{13},-?\d+,/.test(raw)) {
+          this.open = null; // the open record was cut off; this line starts a new one
+        } else {
+          this.open += `\n${raw}`;
+          this.openQuotes += quoteCount(raw);
+          if (this.openQuotes % 2) continue;
+          line = this.open;
+          this.open = null;
+        }
+      } else if (quoteCount(raw) % 2) {
+        this.open = raw;
+        this.openQuotes = quoteCount(raw);
+        continue;
+      }
       if (!line) continue;
       const f = splitCsv(line);
       if (!this.cols) {
@@ -409,7 +435,7 @@ class JtlTailer {
         continue;
       }
       const ts = parseInt(f[this.cols.ts], 10);
-      if (!Number.isFinite(ts)) continue;
+      if (!(ts >= 1e12 && ts < 1e13)) continue; // epoch milliseconds only
       rows.push([ts, parseInt(f[this.cols.elapsed], 10) || 0, f[this.cols.label] || '?', f[this.cols.success] === 'true', f[this.cols.code] || '', f[this.cols.thread] || '']);
     }
     this.rowCount += rows.length;

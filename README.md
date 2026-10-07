@@ -2,6 +2,10 @@
 
 **Self-hosted distributed JMeter load testing** — upload a `.jmx`, spread the load across as many office/lab PCs as you want, and watch a live dashboard. No JMeter, Java, or install needed on the worker PCs: they bootstrap everything themselves from the controller.
 
+![LoadPilot run results](docs/images/09-run-detail.png)
+
+> **New to LoadPilot?** Read the **[User guide](docs/USER-GUIDE.md)** — every screen explained with screenshots, step-by-step recipes, and what LoadPilot can and can't do.
+
 > **Platform note:** LoadPilot is a **Windows** application built with Node.js and packaged into standalone `.exe` files (there is no Android `.apk` — "build the app" here means **building the `.exe` + installer**, covered below).
 
 ---
@@ -9,18 +13,23 @@
 ## Table of contents
 
 - [What it does](#what-it-does)
+- [Screenshots](#screenshots)
 - [How it works](#how-it-works)
 - [Architecture](#architecture)
 - [Repository layout](#repository-layout)
 - [Tech stack — how it was built](#tech-stack--how-it-was-built)
 - [Running from source (development)](#running-from-source-development)
+- [Try it locally with the demo plan](#try-it-locally-with-the-demo-plan)
 - [Building the executables](#building-the-executables)
 - [Building the installers](#building-the-installers)
 - [Deploying / installing](#deploying--installing)
+- [Stopping the controller](#stopping-the-controller)
+- [Updating agents](#updating-agents)
 - [Upgrading JMeter](#upgrading-jmeter)
 - [Managing agents (portable controller)](#managing-agents-portable-controller)
 - [Data & configuration locations](#data--configuration-locations)
 - [Key features](#key-features)
+- [Known limitations](#known-limitations)
 
 ---
 
@@ -32,6 +41,22 @@
    - **Per-agent profiles** — give each agent its own workload (different samplers, threads, rate).
 3. **Start the run.** The controller prepares each agent's copy of the plan, dispatches jobs, and streams live results.
 4. **Watch the live dashboard** (virtual users, throughput, response times, errors — per sampler and per thread group) and get a full **post-run report** you can export to Excel or auto-append to a **Google Sheet**.
+5. **Find out why requests failed** — the Errors tab groups every failure and shows the real request and response, with the assertion explained in plain words.
+
+---
+
+## Screenshots
+
+*(From the demo setup in [`sample/`](#try-it-locally-with-the-demo-plan) — three agents load-testing a local demo site.)*
+
+| | |
+|---|---|
+| **Home** — readiness, today's runs, fleet health<br>![Home](docs/images/01-home.png) | **New run · Workload** — users per thread group and the request tree<br>![Workload](docs/images/04-new-run-step2-workload.png) |
+| **New run · Review** — summary and pre-flight checks<br>![Review](docs/images/06-new-run-step4-review.png) | **Live monitor** — numbers and charts while the test runs<br>![Live](docs/images/07-live-monitor.png) |
+| **Errors** — failures grouped, with request + response<br>![Errors](docs/images/11-run-errors.png) | **Compare** — two runs side by side<br>![Compare](docs/images/14-compare.png) |
+| **Agents & teams**<br>![Agents](docs/images/16-agents.png) | **Reports** — Excel-style report, export to .xlsx<br>![Reports](docs/images/19-reports.png) |
+
+Every screen is explained in the **[User guide](docs/USER-GUIDE.md)**.
 
 ---
 
@@ -82,6 +107,7 @@ A single Node.js process that is both an **HTTP API + static web UI** and a **We
 | `src/report.js` / `src/xlsx.js` | Excel-style report store and `.xlsx` export |
 | `src/scheduler.js` | Scheduled / recurring runs |
 | `src/config.js` | Reads/writes `config.json` (port, data/runtime/bundle dirs) |
+| `src/fsutil.js` | Crash-safe JSON writes (temp file + rename) for settings, library and schedules |
 
 - **Web UI** is plain HTML/CSS/vanilla JS in `controller/public/` — bundled **into** the exe as pkg assets, so a UI change requires a rebuild.
 - **Frontend ↔ backend**: REST (`/api/*`) + two WebSockets (`/ws/agent` for agents, `/ws/ui` for live browser updates).
@@ -93,7 +119,8 @@ A single, **windowless** Node.js exe (`src/agent.js`) that runs in the backgroun
 
 - Connects **outbound** to the controller (`ws://<controller>:4000/ws/agent`); auto-reconnects if the controller restarts.
 - **Self-bootstrapping**: downloads and extracts JMeter (and a JRE if Java is missing) from the controller on first use.
-- **Control endpoint on TCP `4101`** (`/lp-agent/ping`, `/lp-agent/set-controller`): lets a controller *discover* the agent on the LAN and *redirect* it to a different controller. See [Managing agents](#managing-agents-portable-controller).
+- **Control endpoint on TCP `4101`** (`/lp-agent/ping`, `/lp-agent/set-controller`): lets a controller *discover* the agent on the LAN and *redirect* it to a different controller. A redirect must be a real JSON request (no CORS, so a web page can't trigger it) and the agent only switches to an address it can reach. See [Managing agents](#managing-agents-portable-controller).
+- **Keeps worker PCs tidy**: only the last 5 run folders stay in `work/`; the controller holds the real copies.
 - **Self-installer**: `loadpilot-agent.exe --install <controller-url>` registers a startup task and opens the firewall port; `--uninstall` removes them.
 
 ### Communication summary
@@ -124,6 +151,8 @@ loadpilot/
 │   ├── src/agent.js
 │   ├── hide-console.js       # post-build: flips the exe PE subsystem to GUI (windowless)
 │   ├── install-service.bat   # optional manual startup-task installer
+│   ├── update-agent.bat      # one-click agent update on a worker PC (self-elevates)
+│   ├── update-agent.ps1      #   …keeps the PC's agent names, count and controller URL
 │   ├── uninstall-agent.bat
 │   ├── package.json
 │   └── dist/                 # build output: loadpilot-agent.exe
@@ -131,6 +160,14 @@ loadpilot/
 │   ├── loadpilot.iss         # Inno Setup script → LoadPilot-Setup.exe (controller)
 │   ├── agent.iss             # Inno Setup script → LoadPilot-Agent-Setup.exe (agent)
 │   └── dist/                 # build output: the Setup .exe installers
+├── sample/
+│   ├── target-server.js      # tiny local website to load-test (port 9091)
+│   ├── demo-portal.jmx       # demo plan: CSV logins, extractor, assertions, 3 thread groups
+│   ├── students.csv          # fake accounts for the demo plan
+│   └── sample-plan.jmx       # minimal plan
+├── docs/
+│   ├── USER-GUIDE.md         # how to use every screen, recipes, can / can't
+│   └── images/               # screenshots used by the docs
 └── README.md
 ```
 
@@ -172,6 +209,23 @@ Open <http://localhost:4000> in a browser. Any UI edit under `controller/public/
 
 ---
 
+## Try it locally with the demo plan
+
+Everything runs on your own PC and only talks to `localhost` — no real system is load-tested.
+
+```bash
+node sample/target-server.js          # 1. the demo website on http://localhost:9091
+# 2. start the controller (above) and one or more agents, e.g. --name Lab-PC-01
+```
+
+3. Open the UI → **New run** → upload `sample/demo-portal.jmx`.
+4. Step 3: attach `sample/students.csv` for the *Student accounts* data file.
+5. Start. The demo site fails ~2% of logins with a `500`, so the **Errors** tab has something to show.
+
+The screenshots in this README and the user guide were taken exactly this way.
+
+---
+
 ## Building the executables
 
 > This is the "build the app" step. Output is a Windows `.exe`, not an `.apk`.
@@ -197,15 +251,16 @@ Under the hood:
 - `agent`: `npx @yao-pkg/pkg . --output dist/loadpilot-agent.exe && node hide-console.js dist/loadpilot-agent.exe`
   (the second step makes it windowless).
 
-**Deploy an update in place** (no installer needed): stop the running controller, copy the fresh exe over the deployed one, restart. Example used during development:
+**Deploy an update in place** (no installer needed): stop the running controller (make sure no test is running), copy the fresh exe over the deployed one, restart. Example used during development:
 
 ```powershell
-Stop-Process -Name loadpilot-controller -Force
+Invoke-RestMethod -Method Post http://localhost:4000/api/shutdown -ContentType application/json -Body '{}'
+Start-Sleep -Seconds 2   # Windows keeps the exe locked for a moment after it exits
 Copy-Item controller\dist\loadpilot-controller.exe D:\LoadPilot\loadpilot-controller.exe -Force
 Start-Process D:\LoadPilot\loadpilot-controller.exe -WorkingDirectory D:\LoadPilot
 ```
 
-To update agents, replace their `loadpilot-agent.exe` (or reinstall) — user data in `data/` is never touched by swapping the exe.
+User data in `data/` is never touched by swapping the exe. Browsers need **Ctrl+F5** once to load the new UI. To update agents see [Updating agents](#updating-agents).
 
 ---
 
@@ -246,7 +301,32 @@ $iscc = "C:\Users\<you>\AppData\Local\Programs\Inno Setup 6\ISCC.exe"   # or you
   Opens firewall port `4101`, registers a boot startup task, starts immediately. Remove with `--uninstall`.
 - **Wizard:** run `LoadPilot-Agent-Setup.exe`, enter the controller URL, choose auto-start.
 
-Within seconds the PC appears under the **Agents** tab.
+Within seconds the PC appears under **Agents & teams**.
+
+---
+
+## Stopping the controller
+
+- **From the web UI:** **Settings → General → Stop controller…**. If a test is running it asks again; stopping anyway tells the agents to stop JMeter first, and the run is kept as stopped/interrupted. Open pages show a "controller has stopped" banner and reconnect by themselves when it starts again.
+- **From a script:** `POST /api/shutdown` with body `{}` (answers `409` while a test runs; send `{"force":true}` to stop anyway).
+- **Started in a window:** close the window or press **Ctrl+C**.
+- **Last resort:** end `loadpilot-controller.exe` in Task Manager, or `taskkill /IM loadpilot-controller.exe /F`. A run that was in progress is closed as *interrupted* on the next start, keeping whatever results arrived.
+
+Agents stay installed and reconnect automatically when the controller is back.
+
+---
+
+## Updating agents
+
+Agents don't update themselves yet. After building a new `loadpilot-agent.exe`, give each worker PC a folder with:
+
+```
+loadpilot-agent.exe
+update-agent.bat
+update-agent.ps1
+```
+
+and double-click **`update-agent.bat`** on the PC (it asks for administrator rights). It stops the running agents, replaces the exe, and re-registers the start-with-Windows tasks — keeping that PC's agent names, how many agents it runs, and its controller address. Nothing else needs doing on the PC.
 
 ---
 
@@ -273,7 +353,7 @@ Notes:
 
 Because agents expose a control endpoint on port **4101**, no single controller PC has to be permanent:
 
-- **Settings → Portable controller** lets you **discover agents on the LAN**, list each worker PC, **tick which agents this controller owns**, and click **"Point ticked agents here."** The agents switch to whichever controller is running.
+- **Agents & teams → Controller & network** lets you **discover agents on the LAN**, list each worker PC, **tick which agents this controller owns**, and click **"Point ticked agents here."** The agents switch to whichever controller is running, and remember it after a reboot.
 - Two controllers can run at once by ticking **disjoint** sets of agents — each drives its own agents in parallel.
 - Redirect is **per-PC**: all agents on a PC follow together (they watch the shared `config.json`).
 
@@ -286,16 +366,20 @@ The controller keeps everything under its **data directory** (default `data/` ne
 | Path | Contents |
 |---|---|
 | `data/plans/` | uploaded JMX plans + parsed structure |
-| `data/runs/` | per-run results (`run.log`, `merged.jtl`, `report/`) |
-| `data/library/` | reusable CSV data files |
+| `data/runs/<id>/` | one folder per run: `meta.json`, `run.log`, each agent's `results-<agent>.jtl` + `errors-<agent>.xml` (captured failures), the merged `merged.jtl`, `summary.json`, and the JMeter `report/` |
+| `data/library/` | reusable CSV data files (`files.json` is the index) |
 | `data/reports/` | Excel-style reports |
 | `data/jmeter-edit/` | temporary working copies for "Open in JMeter" |
+| `data/schedules.json` | scheduled runs |
+| `data/teams.json` | saved agent teams |
 | `data/sheets.json` | Google Sheets sync config |
 | `data/sla.json` | SLA thresholds |
 | `data/agent-directory.json` | saved agent IPs + enable/redirect state |
 | `config.json` (next to exe) | port, data/runtime/bundle dir overrides |
 
-Agents keep their own `config.json`, downloaded `runtime/` (JMeter/JRE), `work/` (per-run scratch), and `agent.log` next to the agent exe.
+Agents keep their own `config.json`, downloaded `runtime/` (JMeter/JRE), `work/` (the last 5 runs' scratch folders), and `agent.log` next to the agent exe.
+
+> **Don't commit `data/`, `runtime/` or any `config.json`.** They hold run results, captured server responses and uploaded CSVs (often real accounts). The repository's `.gitignore` excludes them.
 
 ---
 
@@ -303,12 +387,24 @@ Agents keep their own `config.json`, downloaded `runtime/` (JMeter/JRE), `work/`
 
 - Distributed load across many PCs, **even-split** or **per-agent profiles**.
 - Full support for **bzm Arrivals/Concurrency** (rate/concurrency) thread groups, split as fractional rates so no agent stalls at rate 0.
-- **Live dashboard**: virtual users, throughput (overall + per sampler), response-time percentiles, errors — with **agent** and **thread-group** filters.
-- **Plan tree** shows thread groups, samplers, controllers, **CSV Data Set Config**, and **pre/post processors**.
+- **Four-step New run wizard** (Plan → Workload → Agents → Review) with **pre-flight checks** that block a start that can't work.
+- **Request tree** — every request with its CSV data, extractors, assertions and pre/post processors; tick requests and controllers on or off per run.
+- **CSV test data per run**: the same file for every agent, rows split across agents, or a different file per agent — with a warning when agents would share accounts.
+- **Live monitor**: virtual users, throughput, response times and errors per request, agent CPU/RAM with saturation and slow-network warnings, filter by thread group.
+- **Results**: aggregate/summary reports, per-agent numbers, charts over time, every request, **agent** and **thread-group** filters, JMeter HTML dashboard, `.jtl` download, print.
+- **Errors explorer** — failures grouped with true counts, every captured example with request + response, assertions explained in plain words, `NOT_FOUND` / unset-variable / shared-account plan problems flagged, Copy as cURL.
+- **SLA verdict** (error rate, p90, throughput) on every run; **compare** any two runs.
+- **Schedules** (daily, weekly, once), **teams** of agents, Excel-style **reports** exportable to `.xlsx`/CSV, optional **Google Sheets** auto-sync (Apps Script webhook).
 - **Open in JMeter** — edit a copy of a plan in the bundled JMeter GUI, then re-import as a new plan.
-- **Reports** exportable to `.xlsx`, plus optional **Google Sheets** auto-sync (Apps Script webhook).
-- **Scheduling** of recurring runs.
-- **No-preinstall agents** — JMeter/JRE bootstrapped on demand; agents run windowless and auto-start.
+- **No-preinstall agents** — JMeter/JRE bootstrapped on demand; agents run windowless and auto-start; one-click `update-agent.bat`.
+- **Resilient**: agents get 30 s to reconnect after a network blip, runs interrupted by a controller restart are closed with the results that arrived, crash-safe settings files, results merged by streaming (no size limit).
+- **Stop the controller from the UI**, light/dark theme.
+
+---
+
+## Known limitations
+
+One test at a time per controller · no login/roles yet (anyone on the LAN can use the UI) · Windows only · JMeter `.jmx` plans with the plugins in the bundle · requests can be switched on/off but not edited in the UI · only CSV Data Set files are distributed to agents · agents don't self-update yet. The full list, with what to do about each, is in the user guide: **[What LoadPilot can't do](docs/USER-GUIDE.md#what-it-cant-do)**.
 
 ---
 
