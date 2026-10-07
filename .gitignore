@@ -134,3 +134,12 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# LoadPilot local data — never commit
+# (run results, captured responses, uploaded CSVs, JMeter runtimes, local settings)
+controller/data/
+controller/runtime/
+controller/config.json
+agent/work/
+agent/runtime/
+agent/config.json
