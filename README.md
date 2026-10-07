@@ -279,7 +279,7 @@ $iscc = "C:\Users\<you>\AppData\Local\Programs\Inno Setup 6\ISCC.exe"   # or you
 & $iscc installer\agent.iss
 ```
 
-- `loadpilot.iss` bundles `loadpilot-controller.exe`, `bundles/jmeter.zip`, the agent exe, and README into a wizard (per-user install, no admin required; user can pick any drive/folder).
+- `loadpilot.iss` bundles `loadpilot-controller.exe`, `bundles/jmeter.zip`, `bundles/jre.zip`, the agent exe, and README into a wizard (per-user install, no admin required; user can pick any drive/folder).
 - `agent.iss` installs the agent on a worker PC, asks for the controller URL + agent name + how many agents to run on that PC, and sets up auto-start at logon.
 
 > **Important:** the installer packages are only current if you recompile them **after** rebuilding the exes. Reinstalling from a stale installer will roll the app back to that older build.

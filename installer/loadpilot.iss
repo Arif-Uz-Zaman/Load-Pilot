@@ -40,6 +40,8 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "..\controller\dist\loadpilot-controller.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; JMeter bundle agents download from the controller (and controller extracts for reports).
 Source: "..\controller\bundles\jmeter.zip"; DestDir: "{app}\bundles"; Flags: ignoreversion
+; JRE fallback for worker PCs without Java installed.
+Source: "..\controller\bundles\jre.zip"; DestDir: "{app}\bundles"; Flags: ignoreversion
 ; The agent installer files, so admins can copy them out to worker PCs.
 Source: "..\agent\dist\loadpilot-agent.exe"; DestDir: "{app}\agent"; Flags: ignoreversion
 Source: "..\agent\uninstall-agent.bat"; DestDir: "{app}\agent"; Flags: ignoreversion
