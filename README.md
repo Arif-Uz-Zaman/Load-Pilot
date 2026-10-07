@@ -230,6 +230,9 @@ The screenshots in this README and the user guide were taken exactly this way.
 
 > This is the "build the app" step. Output is a Windows `.exe`, not an `.apk`.
 
+> [!WARNING]
+> **Do not install the executable files yet.** After building them, follow the steps in [Building the installers](#building-the-installers) to create the installer packages.
+
 Prerequisites: **Node.js 18+** (pkg downloads the `node22-win-x64` base runtime automatically on first build).
 
 ```bash
