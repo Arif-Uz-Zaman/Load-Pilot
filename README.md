@@ -20,6 +20,7 @@
 - [Tech stack — how it was built](#tech-stack--how-it-was-built)
 - [Running from source (development)](#running-from-source-development)
 - [Try it locally with the demo plan](#try-it-locally-with-the-demo-plan)
+- [Build everything in one step](#build-everything-in-one-step)
 - [Building the executables](#building-the-executables)
 - [Building the installers](#building-the-installers)
 - [Deploying / installing](#deploying--installing)
@@ -168,6 +169,8 @@ loadpilot/
 ├── docs/
 │   ├── USER-GUIDE.md         # how to use every screen, recipes, can / can't
 │   └── images/               # screenshots used by the docs
+├── build.bat                 # one-step build: both exes + both installers (double-click)
+├── build.ps1                 #   …the script build.bat runs
 └── README.md
 ```
 
@@ -226,9 +229,33 @@ The screenshots in this README and the user guide were taken exactly this way.
 
 ---
 
+## Build everything in one step
+
+**Double-click `build.bat`** in the repository folder. It builds both executables and both installers, and opens `installer\dist` when it's done:
+
+| Output | Install it on |
+|---|---|
+| `installer\dist\LoadPilot-Setup.exe` | the controller PC |
+| `installer\dist\LoadPilot-Agent-Setup.exe` | each worker PC |
+
+What it does, in order (stopping with a red message at the first problem):
+
+1. Checks for **Node.js 18+** and **Inno Setup 6** (offers to install Inno Setup with `winget` if it's missing), that `controller\bundles\jmeter.zip` and `jre.zip` and every other file the installers pack are present, and that no LoadPilot program is running from the `dist` folders.
+2. Installs the npm packages and builds `controller\dist\loadpilot-controller.exe`.
+3. Installs the npm packages and builds `agent\dist\loadpilot-agent.exe` (windowless).
+4. Compiles `installer\loadpilot.iss` → `LoadPilot-Setup.exe`.
+5. Compiles `installer\agent.iss` → `LoadPilot-Agent-Setup.exe`.
+6. Checks every output was freshly written.
+
+The first build needs internet access (npm packages and pkg's Node base runtime are downloaded once and cached); later builds take about a minute. Run `build.bat -SkipNpmInstall` to reuse the installed packages and build offline. From PowerShell: `powershell -ExecutionPolicy Bypass -File build.ps1`.
+
+The two sections below are the same steps done by hand.
+
+---
+
 ## Building the executables
 
-> This is the "build the app" step. Output is a Windows `.exe`, not an `.apk`.
+> This is the "build the app" step. Output is a Windows `.exe`, not an `.apk`. `build.bat` does this for you — see [Build everything in one step](#build-everything-in-one-step).
 
 > [!WARNING]
 > **Do not install the executable files yet.** After building them, follow the steps in [Building the installers](#building-the-installers) to create the installer packages.
@@ -269,7 +296,7 @@ User data in `data/` is never touched by swapping the exe. Browsers need **Ctrl+
 
 ## Building the installers
 
-For polished first-time installs, the exes are wrapped in [Inno Setup](https://jrsoftware.org/isinfo.php) wizards. **Build the exes first** (above), then compile:
+For polished first-time installs, the exes are wrapped in [Inno Setup](https://jrsoftware.org/isinfo.php) wizards (`build.bat` does this for you too). By hand: **build the exes first** (above), then compile:
 
 ```powershell
 # Requires Inno Setup 6 (provides ISCC.exe)
